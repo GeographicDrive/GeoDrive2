@@ -218,8 +218,7 @@ const settings = {
     mapStyle: 'photoreal',
     flightSensitivity: 0.20,  // Control sens — new default 0.20x (was 1.0)
     flightAcceleration: 3.00, // Acceleration — new default 3.00x (was 1.0)
-    physicsEngine: 'builtin', // 'builtin' | 'jsbsim' — Settings → Experimental toggle
-    gp3dtCollisionEnabled: false, // Settings → Experimental — real Rapier3D collision against GP3DT surfaces (car/bus/plane)
+    groundCollisionPrecision: 1.0, // 0.2–1.0 — Settings → Physics — ground/surface collision sample density (lower = better perf on slower devices)
     invertPitch: false,        // Pitch invert toggle — joystick up = up (false) or down (true)
     occlusionCulling: true,   // Settings → Display — mirrors scene.globe.depthTestAgainstTerrain, and also drives GP3DT no-memory grid culling (see applyGP3DTGridCulling)
     nightTerrainBrightness: 18, // 0–100 — Settings → Display — how bright terrain/imagery/buildings look while Night mode is on
@@ -1983,16 +1982,12 @@ function setRenderMode(mode) {
         mode = 'CSS';
     }
 
-    if (mode !== '3D' && settings.gp3dtCollisionEnabled) {
-        // GP3DT collision only makes sense while the real tileset is being
-        // rendered in Cesium 3D mode — turn it off cleanly rather than let
-        // it keep sampling a hidden scene.
-        settings.gp3dtCollisionEnabled = false;
+    if (mode !== '3D' && gp3dtWorld) {
+        // Ground collision only makes sense while the real tileset is being
+        // rendered in Cesium 3D mode — tear it down cleanly rather than let
+        // it keep sampling a hidden scene. It re-initializes automatically
+        // (see ensureGroundCollisionActive) the next time 3D mode is active.
         teardownGP3DTCollisionWorld();
-        const btn = document.getElementById('btn-toggle-gp3dt-collision');
-        const statusText = document.getElementById('gp3dt-collision-status-text');
-        if (btn) btn.textContent = '🧱 GP3DT Collision: Off';
-        if (statusText) statusText.textContent = 'Off — left 3D Cesium mode.';
     }
 
     const wasCesium = document.body.classList.contains('is-cesium');
@@ -2131,11 +2126,9 @@ function updateVehicleVisuals() {
 document.getElementById('vehicle-select').addEventListener('change', e => {
     state.vehicle = e.target.value; state.speed = 0;
     if (isPlaneType(state.vehicle)) {
-        state.lat = 33.942610;
-        state.lng = -118.411112;
-        state.heading = 90;
-
-        flight.alt = 125;
+        // Switching into the plane keeps its current lat/lng/heading —
+        // it no longer teleports to a fixed spawn point, so switching
+        // back and forth between vehicles never causes an unexpected jump.
         flight.pitch = 0; flight.roll = 0;
         flight.verticalSpeed = 0; flight.throttle = 0;
         flight.gearDown = true; flight.brakeActive = false; flight.reverseActive = false; flight.flapsDown = false;
@@ -3150,132 +3143,34 @@ function ensureFlightSim(reseed) {
     return flightSim;
 }
 
-/**
- * ── EXPERIMENTAL: JSBSim-WASM adapter ──────────────────────────────────
- * The game's default physics is the AdvancedFlightDynamics class above
- * (a full custom 6-DOF sim). This adapter lets Settings → Experimental
- * swap in JSBSim-WASM instead, loaded from a CDN in index.html.
- *
- * Honesty note: there is no actively-maintained "JSBSim-WASM" package —
- * the only public build (jsbsim.js) is roughly a decade old and predates
- * WebAssembly's browser adoption, so its actual API surface (if the file
- * loads at all) is unverified. This adapter therefore probes for a
- * handful of plausible global entry points at first use, and if none of
- * them pan out — or if anything throws during a physics step — it flips
- * settings.physicsEngine back to 'builtin' automatically so the plane
- * never just stops responding.
- */
-const jsbsimAdapter = {
-    probed: false,
-    usable: false,
-    instance: null,
-
-    probe() {
-        this.probed = true;
-        if (window.__jsbsimStatus !== 'ready') { this.usable = false; return false; }
-        try {
-            // Try the handful of global shapes an Emscripten/UMD build of
-            // this vintage plausibly exposes.
-            const candidate = window.JSBSim || window.jsbsim || (window.Module && window.Module.JSBSim);
-            if (!candidate) { this.usable = false; return false; }
-            this.instance = (typeof candidate === 'function') ? new candidate() : candidate;
-            // A minimal sanity check — if it doesn't even look like a sim
-            // object, don't pretend it's usable.
-            this.usable = !!this.instance;
-            return this.usable;
-        } catch (err) {
-            console.warn('[JSBSim-WASM] Probe failed, falling back to built-in physics:', err);
-            this.usable = false;
-            return false;
-        }
-    },
-
-    isReady() {
-        if (!this.probed) this.probe();
-        return this.usable;
-    },
-
-    /** Attempt one physics step. Returns true if JSBSim handled it. */
-    step(dt, controls) {
-        if (!this.usable || !this.instance) return false;
-        try {
-            // Best-effort call shape — unverified against a real API.
-            if (typeof this.instance.setControls === 'function') this.instance.setControls(controls);
-            if (typeof this.instance.run === 'function') this.instance.run(dt);
-            else if (typeof this.instance.step === 'function') this.instance.step(dt);
-            else return false;
-            return true;
-        } catch (err) {
-            console.warn('[JSBSim-WASM] Runtime step failed, reverting to built-in physics:', err);
-            this.usable = false;
-            return false;
-        }
-    }
-};
-
-/**
- * togglePhysicsEngine — Settings → Experimental button. Switches the
- * active flight-physics backend between the game's built-in 6-DOF sim
- * and JSBSim-WASM (if it actually loaded and probes as usable).
- */
-function togglePhysicsEngine() {
-    const btn = document.getElementById('btn-toggle-physics-engine');
-    const statusText = document.getElementById('physics-engine-status-text');
-
-    if (settings.physicsEngine === 'builtin') {
-        if (!jsbsimAdapter.isReady()) {
-            const reason = window.__jsbsimStatus === 'unavailable'
-                ? 'JSBSim-WASM could not be loaded from any CDN — staying on built-in physics.'
-                : (window.__jsbsimStatus === 'loading'
-                    ? 'JSBSim-WASM is still loading — try again in a moment.'
-                    : 'JSBSim-WASM loaded but exposes no usable API — staying on built-in physics.');
-            if (statusText) statusText.textContent = reason;
-            return;
-        }
-        settings.physicsEngine = 'jsbsim';
-        if (btn) btn.textContent = '✈️ Physics Engine: JSBSim (Experimental)';
-        if (statusText) statusText.textContent = 'Using JSBSim-WASM. If it misbehaves or errors, this reverts to built-in physics automatically.';
-    } else {
-        settings.physicsEngine = 'builtin';
-        if (btn) btn.textContent = '✈️ Physics Engine: Built-in';
-        if (statusText) statusText.textContent = 'Using the built-in flight model.';
-    }
-}
-
-document.addEventListener('jsbsim-status-change', () => {
-    const statusText = document.getElementById('physics-engine-status-text');
-    if (!statusText || settings.physicsEngine === 'jsbsim') return;
-    if (window.__jsbsimStatus === 'ready') {
-        statusText.textContent = 'JSBSim-WASM loaded — tap the button to try it.';
-    } else if (window.__jsbsimStatus === 'unavailable') {
-        statusText.textContent = 'JSBSim-WASM could not be loaded from any CDN — built-in physics only.';
-    }
-});
-
 // ==========================================
-// GP3DT COLLISION (EXPERIMENTAL) — Rapier3D
+// GROUND COLLISION — Rapier3D
 // ==========================================
-// Settings → Experimental → "GP3DT Collision". When ON, every frame we
-// raycast straight down (Cesium's synchronous scene.sampleHeight, which
-// reads whatever is actually rendered — GP3DT tiles, OSM Buildings, or
-// terrain) at a small ring of points around the vehicle to measure the
-// REAL surface around it, feed only those freshly-measured points into a
-// Rapier3D physics world as colliders, and step the vehicle's dynamic
-// rigid body through them to resolve the frame's intended move.
+// Ground/surface collision for Car, Bus, and Plane — always active while
+// in 3D Cesium mode (no toggle; see Settings → Physics for the Precision
+// slider). Every frame we raycast straight down (Cesium's synchronous
+// scene.sampleHeight, which reads whatever is actually rendered — GP3DT
+// tiles, OSM Buildings, or terrain) at a small ring of points around the
+// vehicle to measure the REAL surface around it, feed only those
+// freshly-measured points into a Rapier3D physics world as colliders, and
+// step the vehicle's dynamic rigid body through them to resolve the
+// frame's intended move.
 //
 // Deliberately NOT done: no static/precomputed collision mesh, no
 // approximate bounding boxes placed "because a building is probably
 // there". Every collider that exists this frame was built from a real
 // sample taken this frame and is thrown away and rebuilt next frame —
 // so there is nothing left lying around to become an invisible spike or
-// wall if the tileset streams in more/less detail later.
+// wall if the tileset streams in more/less detail later. The Precision
+// slider only changes how many of those real samples are taken per
+// frame — it never fabricates or reuses stale ones.
 //
 // Honesty note: this is horizontal-collision + ground-contact resolution
 // via Rapier's contact solver, not a full mesh-accurate simulation —
 // Cesium's 3D Tiles renderer doesn't expose real-time triangle meshes to
 // the page, so a ring of height/occupancy samples around the vehicle
 // footprint is the practical way to get real, non-fabricated collision
-// data out of GP3DT each frame.
+// data each frame.
 window.__rapierStatus = 'idle'; // 'idle' | 'loading' | 'ready' | 'unavailable'
 let RAPIER = null;
 let gp3dtWorld = null, gp3dtBody = null, gp3dtBodyCollider = null;
@@ -3335,50 +3230,83 @@ function teardownGP3DTCollisionWorld() {
     gp3dtWorld = null; gp3dtBody = null; gp3dtBodyCollider = null;
 }
 
-/** toggleGP3DTCollision — Settings → Experimental button. */
-function toggleGP3DTCollision() {
-    const btn = document.getElementById('btn-toggle-gp3dt-collision');
-    const statusText = document.getElementById('gp3dt-collision-status-text');
+// ── Invisible ground-tracking plane (AGL) ──────────────────────────────
+// Lightweight, independent of the Rapier collision world above — just a
+// synchronous terrain-height probe plus the smoothing/throttle state used
+// by updateCesiumCamera() to compute real AGL every frame.
+let _groundPlaneSampleAccum = 0;
+let _groundPlaneTargetHeight = 0;
+let _groundPlaneSmoothedHeight = null;
 
-    if (!settings.gp3dtCollisionEnabled) {
-        if (!cesiumViewer || settings.renderMode !== '3D') {
-            if (statusText) statusText.textContent = 'Switch to 3D Cesium mode first — GP3DT collision needs the real tileset.';
-            return;
-        }
-        if (statusText) statusText.textContent = 'Loading Rapier3D…';
-        ensureRapierLoaded().then(mod => {
-            if (!mod) {
-                if (statusText) statusText.textContent = 'Rapier3D could not be loaded from the CDN — collision unavailable.';
-                return;
-            }
-            if (!initGP3DTCollisionWorld()) {
-                if (statusText) statusText.textContent = 'Rapier3D loaded but the collision world failed to initialize.';
-                return;
-            }
-            settings.gp3dtCollisionEnabled = true;
-            if (btn) btn.textContent = '🧱 GP3DT Collision: On';
-            if (statusText) statusText.textContent = 'Active — colliding against live GP3DT surface samples in Car, Bus, and Plane mode.';
-            saveSettingsV2();
-        });
-    } else {
-        settings.gp3dtCollisionEnabled = false;
-        teardownGP3DTCollisionWorld();
-        if (btn) btn.textContent = '🧱 GP3DT Collision: Off';
-        if (statusText) statusText.textContent = 'Off — using normal (non-collidable) movement.';
-        saveSettingsV2();
+function sampleTerrainHeightMeters(lat, lng) {
+    if (!cesiumViewer || settings.renderMode !== '3D') return 0;
+    try {
+        const h = cesiumViewer.scene.sampleHeight(Cesium.Cartographic.fromDegrees(lng, lat));
+        return (h === undefined || h === null) ? null : h;
+    } catch (err) {
+        return null;
     }
 }
 
+let _groundCollisionInitInFlight = false;
+
+/**
+ * ensureGroundCollisionActive — lazily loads Rapier3D and initializes the
+ * collision world the first time it's needed (3D Cesium mode with a real
+ * tileset), then just keeps it running. Ground collision is a standard,
+ * always-on part of driving/flying now — there is no manual toggle for it,
+ * only the Precision slider (Settings → Physics), which trades sample
+ * density for performance rather than turning collision off entirely.
+ */
+function ensureGroundCollisionActive() {
+    if (gp3dtWorld || _groundCollisionInitInFlight) return;
+    if (!cesiumViewer || settings.renderMode !== '3D') return;
+    _groundCollisionInitInFlight = true;
+    const statusText = document.getElementById('ground-collision-status-text');
+    ensureRapierLoaded().then(mod => {
+        _groundCollisionInitInFlight = false;
+        if (!mod) {
+            if (statusText) statusText.textContent = 'Ground collision physics could not be loaded — using normal (non-collidable) movement.';
+            return;
+        }
+        if (!initGP3DTCollisionWorld()) return;
+        if (statusText) statusText.textContent = 'Active — colliding against live surface samples in Car, Bus, and Plane mode.';
+    });
+}
+
+/** updateGroundCollisionPrecision — Settings → Physics slider. */
+function updateGroundCollisionPrecision(val) {
+    settings.groundCollisionPrecision = parseFloat(val);
+    const label = document.getElementById('val-ground-collision-precision');
+    if (label) label.textContent = settings.groundCollisionPrecision >= 1.0 ? 'Full' : Math.round(settings.groundCollisionPrecision * 100) + '%';
+    saveSettingsV2();
+}
+
 // Ring of sample points (meters, relative to vehicle-forward heading) used to
-// probe real GP3DT height each frame. Center gives ground height; the ring
-// gives walls/buildings/terrain rises around the footprint.
-const _GP3DT_SAMPLE_RING = [
+// probe the real ground/surface height each frame. Center gives ground
+// height; the ring gives walls/buildings/terrain rises around the footprint.
+// Precision below 1.0 thins this ring out (cheaper, at the cost of missing
+// the odd small bump) rather than disabling collision altogether.
+const _GP3DT_SAMPLE_RING_FULL = [
     { fwd: 0,   side: 0    },
     { fwd: 3.0, side: 0    }, { fwd: -3.0, side: 0    },
     { fwd: 2.2, side: 1.6  }, { fwd: 2.2, side: -1.6  },
     { fwd: -2.2, side: 1.6 }, { fwd: -2.2, side: -1.6 },
     { fwd: 0,   side: 1.8  }, { fwd: 0,   side: -1.8  },
 ];
+function _activeSampleRing() {
+    const p = Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision));
+    if (p >= 1.0) return _GP3DT_SAMPLE_RING_FULL;
+    // Always keep the center (ground height) point; thin the outer ring
+    // proportionally to precision so the missing points don't cluster on
+    // one side of the vehicle.
+    const [center, ...ring] = _GP3DT_SAMPLE_RING_FULL;
+    const keep = Math.max(2, Math.round(ring.length * p));
+    const step = ring.length / keep;
+    const thinned = [];
+    for (let i = 0; i < keep; i++) thinned.push(ring[Math.floor(i * step)]);
+    return [center, ...thinned];
+}
 
 /**
  * applyGP3DTCollision — called once per frame from the main loop, after the
@@ -3390,7 +3318,8 @@ const _GP3DT_SAMPLE_RING = [
  * prevLat/prevLng: vehicle position BEFORE this frame's normal integration.
  */
 function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
-    if (!settings.gp3dtCollisionEnabled || !gp3dtWorld || !cesiumViewer || !photorealTileset) return;
+    if (!cesiumViewer || !photorealTileset || settings.renderMode !== '3D') return;
+    if (!gp3dtWorld) { ensureGroundCollisionActive(); return; } // not ready yet this frame — try again next frame
     // Planes only collide near the ground (taxi/takeoff/landing) — at
     // cruise altitude there's nothing meaningful under a 3-8m sample ring
     // and it would just waste sampleHeight calls every frame.
@@ -3410,7 +3339,7 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
         _gp3dtGroundColliders = [];
 
         const hdg = prevHeadingRad;
-        for (const p of _GP3DT_SAMPLE_RING) {
+        for (const p of _activeSampleRing()) {
             // Rotate the sample offset by vehicle heading into east/north meters.
             const east  = p.fwd * Math.sin(hdg) + p.side * Math.cos(hdg);
             const north = p.fwd * Math.cos(hdg) - p.side * Math.sin(hdg);
@@ -3451,21 +3380,11 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
         state.lat = prevLat + resolved.z / mPerDegLat;
         state.lng = prevLng + resolved.x / mPerDegLng;
     } catch (err) {
-        // Never let an experimental collision failure stall the game loop —
-        // fall back to whatever the normal integrator already produced.
-        console.warn('[GP3DT Collision] step failed, leaving movement uncollided this frame:', err);
+        // Never let a collision-step failure stall the game loop — fall
+        // back to whatever the normal integrator already produced.
+        console.warn('[Ground Collision] step failed, leaving movement uncollided this frame:', err);
     }
 }
-
-document.addEventListener('DOMContentLoaded', () => {
-    if (settings.gp3dtCollisionEnabled) {
-        // Was on in a previous session — collision world gets (re)built lazily
-        // once Rapier + Cesium are actually ready, so just reset the flag here
-        // and let the user re-enable via the toggle (keeps startup simple and
-        // avoids racing Cesium's own async init).
-        settings.gp3dtCollisionEnabled = false;
-    }
-});
 
 const flight = {
     pitch: 0, roll: 0,
@@ -3814,6 +3733,50 @@ setupApKnob('ap-knob-hdg', 'ap-knob-hdg-img', 'hdg');
 setupApKnob('ap-knob-alt', 'ap-knob-alt-img', 'alt');
 setupApKnob('ap-knob-vs', 'ap-knob-vs-img', 'vs');
 
+/**
+ * setupApWindowDragAndMinimize — makes the whole autopilot GUI draggable
+ * (via its titlebar) and minimizable, matching the PFD window's behavior.
+ * Deliberately no close button: the autopilot panel is a core instrument,
+ * so it can be tucked away but never dismissed entirely.
+ */
+function setupApWindowDragAndMinimize() {
+    const win = document.getElementById('autopilot-panel');
+    const titlebar = document.getElementById('ap-titlebar');
+    const minBtn = document.getElementById('btn-ap-min');
+    if (!win || !titlebar || !minBtn) return;
+
+    let dragging = false, dragOX = 0, dragOY = 0;
+
+    titlebar.addEventListener('pointerdown', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        dragging = true;
+        const r = win.getBoundingClientRect();
+        dragOX = e.clientX - r.left;
+        dragOY = e.clientY - r.top;
+        titlebar.setPointerCapture(e.pointerId);
+    });
+    titlebar.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        let x = e.clientX - dragOX;
+        let y = e.clientY - dragOY;
+        x = Math.max(0, Math.min(window.innerWidth - 60, x));
+        y = Math.max(0, Math.min(window.innerHeight - 40, y));
+        win.style.left = x + 'px';
+        win.style.top = y + 'px';
+        win.style.right = 'auto';
+    });
+    ['pointerup', 'pointercancel'].forEach(ev =>
+        titlebar.addEventListener(ev, () => { dragging = false; }));
+
+    let minimized = false;
+    minBtn.addEventListener('click', () => {
+        minimized = !minimized;
+        win.classList.toggle('ap-minimized', minimized);
+        minBtn.textContent = minimized ? '▢' : '–';
+    });
+}
+setupApWindowDragAndMinimize();
+
 function updateFlight(dt) {
     // PHYSICS — full 6-DOF AeroToolbox-based simulation (AdvancedFlightDynamics).
     // dt is clamped defensively: RK4 is stable for game-scale steps, but a huge
@@ -4004,21 +3967,7 @@ function updateFlight(dt) {
     sim.state[10] = 0; sim.state[11] = 0;
     const prevZ = sim.state[12]; // NED z before this step (for altitude delta below)
 
-    // EXPERIMENTAL: if JSBSim-WASM is selected, try it first — but always
-    // fall back to the built-in RK4 integrator above on any failure so a
-    // bad/absent CDN build never leaves the plane un-simulated.
-    let usedJSBSim = false;
-    if (settings.physicsEngine === 'jsbsim') {
-        usedJSBSim = jsbsimAdapter.step(dt, controls);
-        if (!usedJSBSim) {
-            settings.physicsEngine = 'builtin';
-            const btn = document.getElementById('btn-toggle-physics-engine');
-            const statusText = document.getElementById('physics-engine-status-text');
-            if (btn) btn.textContent = '✈️ Physics Engine: Built-in';
-            if (statusText) statusText.textContent = 'JSBSim-WASM failed during flight — reverted to built-in physics.';
-        }
-    }
-    if (!usedJSBSim) sim.integrate(dt, controls);
+    sim.integrate(dt, controls);
 
     // ── Pull results back into the legacy fields the rest of the game reads ──
     const euler = sim.getEulerAngles();
@@ -5439,13 +5388,40 @@ function updateCesiumCamera(dt) {
 
     const isPlane = isPlaneType(state.vehicle);
 
-    // Terrain sampling/collision has been removed — every vehicle is
-    // anchored to a flat reference height (sea level / ellipsoid 0). The
-    // plane's displayed altitude (flight.alt, from AdvancedFlightDynamics)
-    // is still fully simulated; it's just no longer reconciled against a
-    // real-world elevation probe.
-    const groundHeight = 0;
-    if (isPlane && flight.groundRef === null) flight.groundRef = 0;
+    // ── AGL (Above Ground Level) via an invisible ground-tracking plane ──
+    // We keep a second, invisible "plane" that always sits on the real
+    // terrain directly beneath the visible vehicle's current lat/lng — a
+    // shadow that never leaves the ground. Its height is what flight.alt
+    // (AGL, in feet) is measured from: while airborne we continuously
+    // recompute the vertical distance between the real plane and this
+    // ground plane; when they're at the same horizontal position and the
+    // real plane settles onto it, that's ground contact (taxi/landing).
+    //
+    // Sampling the real terrain every frame is the accurate way to do
+    // this, but scene.sampleHeight() isn't free — so how often we
+    // resample is throttled by settings.groundCollisionPrecision (Settings
+    // → Physics). At full precision we resample every frame; at lower
+    // precision we resample less often and smoothly interpolate toward
+    // the new reading in between, which avoids the "invisible bump" you'd
+    // get from just snapping to a stale sample.
+    _groundPlaneSampleAccum += dt;
+    const _precision = Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision));
+    const _sampleInterval = (1 - _precision) * 0.4; // seconds; 0 at full precision
+    if (_groundPlaneSampleAccum >= _sampleInterval) {
+        _groundPlaneSampleAccum = 0;
+        const sampled = sampleTerrainHeightMeters(state.lat, state.lng);
+        if (sampled !== null) _groundPlaneTargetHeight = sampled;
+    }
+    if (_groundPlaneSmoothedHeight === null) {
+        _groundPlaneSmoothedHeight = _groundPlaneTargetHeight;
+    } else {
+        const alpha = 1 - Math.exp(-10 * dt);
+        _groundPlaneSmoothedHeight += (_groundPlaneTargetHeight - _groundPlaneSmoothedHeight) * alpha;
+    }
+    const groundHeight = _groundPlaneSmoothedHeight || 0;
+    // groundRef IS the invisible ground plane's current height — updated
+    // continuously (never frozen) so flight.alt always reflects real AGL.
+    flight.groundRef = groundHeight;
 
     // Pitch/roll: true flight attitude for the plane; ground vehicles stay
     // level (no terrain-follow tilt, no ragdoll tumble).
@@ -6069,10 +6045,9 @@ function update() {
         state.heading = (state.heading + 360) % 360;
     }
 
-    // ── GP3DT Collision (experimental, Settings → Experimental toggle) ─────
-    if (settings.gp3dtCollisionEnabled) {
-        applyGP3DTCollision(dt, _gp3dtPrevLat, _gp3dtPrevLng, _gp3dtPrevHdgRad);
-    }
+    // ── Ground Collision — always on while in 3D Cesium mode; the function
+    // itself lazily initializes on first use and no-ops until it's ready. ──
+    applyGP3DTCollision(dt, _gp3dtPrevLat, _gp3dtPrevLng, _gp3dtPrevHdgRad);
 
     // ── Smooth camera heading ─────────────────────────────────────────────
     let diff = (state.heading - camHeading + 180) % 360 - 180;

@@ -110,7 +110,6 @@
                     <button class="settings-tab" data-mode="general" data-tab="gen-graphics" onclick="switchSettingsTab('gen-graphics')">🎨 Graphics</button>
                     <button class="settings-tab" data-mode="general" data-tab="gen-interface" onclick="switchSettingsTab('gen-interface')">🖼️ Interface</button>
                     <button class="settings-tab" data-mode="general" data-tab="gen-troubleshoot" onclick="switchSettingsTab('gen-troubleshoot')">🔧 Troubleshooting</button>
-                    <button class="settings-tab" data-mode="general" data-tab="experimental" onclick="switchSettingsTab('experimental')">🧪 Experimental</button>
                     <button class="settings-tab" data-mode="general" data-tab="gen-about" onclick="switchSettingsTab('gen-about')">ℹ️ About</button>
                 </div>
 
@@ -282,6 +281,19 @@
                 </div>
 
                 <div class="settings-panel-content" data-mode="3d" data-tab="physics3d">
+                <div class="settings-section">
+                    <h3>🛡️ Ground Collision</h3>
+                    <p class="desc-text" style="margin-top:0;">
+                        Car, Bus, and Plane all collide with the real ground/surface as they drive — colliders are
+                        built live from real terrain/building samples each frame, so nothing is placed in advance.
+                    </p>
+                    <label style="margin-top:12px;">Precision: <span id="val-ground-collision-precision">Full</span></label>
+                    <input type="range" class="slider" id="set-ground-collision-precision" min="0.2" max="1.0" step="0.1" value="1.0" oninput="updateGroundCollisionPrecision(this.value)">
+                    <p class="desc-text" id="ground-collision-status-text">
+                        Lower precision samples the surface less often, trading a small amount of accuracy (occasional
+                        soft bumps) for smoother performance on slower devices.
+                    </p>
+                </div>
                 </div>
 
                 <div class="settings-panel-content" data-mode="3d" data-tab="controls3d">
@@ -504,29 +516,6 @@
                 </div>
                 </div>
 
-                <div class="settings-panel-content" data-mode="general" data-tab="experimental">
-                <div class="settings-section" style="border-color: #f59e0b; background: rgba(245, 158, 11, 0.08);">
-                    <h3 style="color: #f59e0b;">🧪 Experimental</h3>
-                    <button class="btn-ui" id="btn-toggle-physics-engine" onclick="togglePhysicsEngine()" style="width:100%;">
-                        ✈️ Physics Engine: Built-in
-                    </button>
-                    <p class="desc-text" id="physics-engine-status-text" style="margin-top:10px;">
-                        Loading JSBSim-WASM from CDN…
-                    </p>
-                </div>
-                <div class="settings-section" style="border-color: #f59e0b; background: rgba(245, 158, 11, 0.08); margin-top:14px;">
-                    <h3 style="color: #f59e0b;">🧱 GP3DT Collision</h3>
-                    <button class="btn-ui" id="btn-toggle-gp3dt-collision" onclick="toggleGP3DTCollision()" style="width:100%;">
-                        🧱 GP3DT Collision: Off
-                    </button>
-                    <p class="desc-text" id="gp3dt-collision-status-text" style="margin-top:10px;">
-                        Rapier3D physics loads from CDN the first time you enable this. Colliders are built live from real
-                        GP3DT surface samples every frame (raycast against the actual tileset) — nothing static is placed,
-                        so there are no invisible spikes or walls. Works in Car, Bus, and Plane mode.
-                    </p>
-                </div>
-                </div>
-
                 <div class="settings-panel-content" data-mode="general" data-tab="gen-about">
                 <div class="settings-section">
                     <h3>ℹ️ About</h3>
@@ -703,6 +692,13 @@
              three rotary wheels (drag in a circle, or scroll) to dial in the
              targets, and an engage/disengage toggle. -->
         <div id="autopilot-panel">
+            <div id="ap-titlebar">
+                <span class="ap-title">AUTOPILOT</span>
+                <div class="ap-btns">
+                    <button id="btn-ap-min" title="Minimize">–</button>
+                </div>
+            </div>
+            <div id="ap-body">
             <div id="ap-display">
                 <div class="ap-display-col">
                     <span class="ap-display-label">SPD</span>
@@ -753,6 +749,7 @@
                 <button id="btn-ap-hdg" class="ap-toggle-btn ap-toggle-btn-sm" onclick="toggleApChannel('hdg')" title="Engage / disengage heading hold">HDG</button>
                 <button id="btn-ap-alt" class="ap-toggle-btn ap-toggle-btn-sm" onclick="toggleApChannel('alt')" title="Engage / disengage altitude hold">ALT</button>
                 <button id="btn-ap-vs" class="ap-toggle-btn ap-toggle-btn-sm" onclick="toggleApChannel('vs')" title="Engage / disengage vertical-speed hold (mutually exclusive with ALT)">V/S</button>
+            </div>
             </div>
         </div>
     </div>
@@ -1006,50 +1003,6 @@
 <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/Cesium.js"></script>
 
-
-<!-- JSBSim-WASM (EXPERIMENTAL, optional flight physics engine) — loaded
-     directly off a public CDN, zero install/build step required.
-     NOTE: there is no actively-maintained official "JSBSim-WASM" npm
-     package. The only public build is a ~decade-old Emscripten port
-     (jsbsim.js), so this is loaded best-effort: if it 404s, doesn't
-     expose a usable API, or throws at runtime, the game silently keeps
-     using its own built-in 6-DOF physics. See window.__jsbsimStatus and
-     the Settings → Experimental tab for load/availability state. -->
-<script>
-window.__jsbsimStatus = 'loading'; // 'loading' | 'ready' | 'unavailable'
-(function loadJSBSimWasm() {
-    const sources = [
-        'https://cdn.jsdelivr.net/npm/jsbsim.js/dist/jsbsim.js',
-        'https://unpkg.com/jsbsim.js/dist/jsbsim.js'
-    ];
-    let i = 0;
-    function tryNext() {
-        if (i >= sources.length) {
-            window.__jsbsimStatus = 'unavailable';
-            console.warn('[JSBSim-WASM] Not available from any CDN source — experimental physics disabled, using built-in flight model.');
-            document.dispatchEvent(new Event('jsbsim-status-change'));
-            return;
-        }
-        const src = sources[i++];
-        const s = document.createElement('script');
-        s.src = src;
-        s.async = true;
-        s.onload = () => {
-            // Loading the file is not the same as it being usable — the
-            // actual API surface (if any) is verified lazily on first use.
-            window.__jsbsimStatus = 'ready';
-            console.log('[JSBSim-WASM] Script loaded from ' + src);
-            document.dispatchEvent(new Event('jsbsim-status-change'));
-        };
-        s.onerror = () => {
-            console.warn('[JSBSim-WASM] Failed to load from ' + src);
-            tryNext();
-        };
-        document.head.appendChild(s);
-    }
-    tryNext();
-})();
-</script>
 
 <script src="script.js"></script>
 <script src="pfd.js"></script>

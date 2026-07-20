@@ -1781,13 +1781,59 @@ body.theme-light select { color: #0f172a; }
    chrome-ringed knobs below (a plain wheel, a wheel with a decorative
    star ring, and a darker/black wheel), plus an engage toggle button. */
 #autopilot-panel {
-    position: absolute;
+    position: fixed;
     top: calc(120px + env(safe-area-inset-top, 0px));
     left: calc(20px + env(safe-area-inset-left, 0px));
-    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 0;
     pointer-events: auto;
     z-index: 20;
+    background: #0a0d12;
+    border: 2px solid #3a4552;
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.55);
 }
+
+/* Titlebar — drag handle. No close button by design: the autopilot panel
+   is a core instrument, so it can only be minimized, never dismissed. */
+#ap-titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: linear-gradient(180deg, #1c242e, #12171d);
+    border-bottom: 1px solid #3a4552;
+    border-radius: 8px 8px 0 0;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+}
+#ap-titlebar:active { cursor: grabbing; }
+#ap-titlebar .ap-title {
+    color: #7fd3ff;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+#ap-titlebar .ap-btns { display: flex; gap: 6px; }
+#ap-titlebar button {
+    width: 22px; height: 22px;
+    border-radius: 4px;
+    border: 1px solid #3a4552;
+    background: #202a34;
+    color: #cfe8ff;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+}
+#ap-titlebar button:hover { background: #2c3947; }
+
+#ap-body {
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    padding: 8px;
+}
+#autopilot-panel.ap-minimized #ap-body { display: none; }
+#autopilot-panel.ap-minimized { width: 180px; }
 
 #ap-display {
     display: flex;
