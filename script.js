@@ -2146,7 +2146,7 @@ document.getElementById('vehicle-select').addEventListener('change', e => {
         const slider = document.getElementById('flight-throttle-slider');
         const val = document.getElementById('flight-throttle-val');
         if (slider) slider.value = 0;
-        if (val) val.textContent = '0%';
+        if (val) val.textContent = formatThrottleReadout(0);
 
         const yawSliderEl = document.getElementById('flight-yaw-slider');
         if (yawSliderEl) yawSliderEl.value = 0;
@@ -2541,6 +2541,49 @@ function cancelNavigation() {
     });
     ['pointerup', 'pointercancel'].forEach(ev =>
         handle.addEventListener(ev, () => { resizing = false; }));
+})();
+
+/**
+ * Drag-to-move + minimize for the NAV MAP overlay (no close button — the
+ * map has no way to be fully dismissed, only collapsed to its header).
+ * Mirrors the PFD window's drag/minimize behavior.
+ */
+(function () {
+    const overlay  = document.getElementById('gps-minimap-overlay');
+    const header   = document.getElementById('gps-minimap-header');
+    const minBtn   = document.getElementById('gps-minimap-btn-min');
+    if (!overlay || !header || !minBtn) return;
+
+    let dragging = false, dragOX = 0, dragOY = 0, minimized = false;
+
+    header.addEventListener('pointerdown', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        dragging = true;
+        const r = overlay.getBoundingClientRect();
+        dragOX = e.clientX - r.left;
+        dragOY = e.clientY - r.top;
+        try { header.setPointerCapture(e.pointerId); } catch (err) {}
+        e.preventDefault();
+    });
+    header.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        let x = e.clientX - dragOX;
+        let y = e.clientY - dragOY;
+        x = Math.max(0, Math.min(window.innerWidth - 60, x));
+        y = Math.max(0, Math.min(window.innerHeight - 40, y));
+        overlay.style.left = x + 'px';
+        overlay.style.top = y + 'px';
+        overlay.style.right = 'auto';
+    });
+    ['pointerup', 'pointercancel'].forEach(ev =>
+        header.addEventListener(ev, () => { dragging = false; }));
+
+    minBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        minimized = !minimized;
+        overlay.classList.toggle('nav-minimized', minimized);
+        minBtn.textContent = minimized ? '▢' : '–';
+    });
 })();
 
 
@@ -3597,12 +3640,21 @@ function setupFlightJoystick(baseId, knobId) {
 setupFlightJoystick('flight-joystick-base', 'flight-joystick-knob');
 updateAutopilotUI();
 
+// Throttle readout: shows the detent name (IDLE / CL / FLX-MCT / TOGA)
+// only when the value is exactly on that detent (0 / 21 / 57 / 100 —
+// same numbers as the throttle-quadrant's click points below), and the
+// plain percentage everywhere else.
+const THROTTLE_DETENT_LABELS = { 0: 'IDLE', 21: 'CL', 57: 'FLX/MCT', 100: 'TOGA' };
+function formatThrottleReadout(v) {
+    return THROTTLE_DETENT_LABELS[v] !== undefined ? THROTTLE_DETENT_LABELS[v] : (v + '%');
+}
+
 const throttleSlider = document.getElementById('flight-throttle-slider');
 const throttleValDisplay = document.getElementById('flight-throttle-val');
 if (throttleSlider) {
     throttleSlider.addEventListener('input', (e) => {
         flight.throttle = parseInt(e.target.value);
-        if (throttleValDisplay) throttleValDisplay.textContent = flight.throttle + '%';
+        if (throttleValDisplay) throttleValDisplay.textContent = formatThrottleReadout(flight.throttle);
     });
 }
 
@@ -5908,7 +5960,7 @@ function pollGamepad() {
         const tSlider = document.getElementById('flight-throttle-slider');
         const tVal    = document.getElementById('flight-throttle-val');
         if (tSlider) tSlider.value = flight.throttle;
-        if (tVal)    tVal.textContent = flight.throttle + '%';
+        if (tVal)    tVal.textContent = formatThrottleReadout(flight.throttle);
     }
 
     // ── Brake — Button 2 (top-left cluster, first side button) ───────────
