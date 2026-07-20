@@ -1982,13 +1982,9 @@ function setRenderMode(mode) {
         mode = 'CSS';
     }
 
-    if (mode !== '3D' && gp3dtWorld) {
-        // Ground collision only makes sense while the real tileset is being
-        // rendered in Cesium 3D mode — tear it down cleanly rather than let
-        // it keep sampling a hidden scene. It re-initializes automatically
-        // (see ensureGroundCollisionActive) the next time 3D mode is active.
-        teardownGP3DTCollisionWorld();
-    }
+    // Ground collision (applyGP3DTCollision) already checks
+    // settings.renderMode === '3D' itself each frame — no persistent
+    // world/state to tear down when leaving 3D mode.
 
     const wasCesium = document.body.classList.contains('is-cesium');
     settings.renderMode = mode;
@@ -3151,88 +3147,29 @@ function ensureFlightSim(reseed) {
 // slider). Every frame we raycast straight down (Cesium's synchronous
 // scene.sampleHeight, which reads whatever is actually rendered — GP3DT
 // tiles, OSM Buildings, or terrain) at a small ring of points around the
-// vehicle to measure the REAL surface around it, feed only those
-// freshly-measured points into a Rapier3D physics world as colliders, and
-// step the vehicle's dynamic rigid body through them to resolve the
-// frame's intended move.
+// vehicle to measure the REAL surface around it, and use those readings
+// directly to resolve the frame's intended move — no physics engine
+// involved, just real height samples compared against each other.
 //
 // Deliberately NOT done: no static/precomputed collision mesh, no
 // approximate bounding boxes placed "because a building is probably
-// there". Every collider that exists this frame was built from a real
-// sample taken this frame and is thrown away and rebuilt next frame —
-// so there is nothing left lying around to become an invisible spike or
-// wall if the tileset streams in more/less detail later. The Precision
-// slider only changes how many of those real samples are taken per
-// frame — it never fabricates or reuses stale ones.
+// there", no third-party physics library. Every sample used this frame
+// is taken fresh this frame and thrown away — so there is nothing left
+// lying around to become an invisible spike or wall if the tileset
+// streams in more/less detail later. The Precision slider only changes
+// how many real samples are taken (and how many refinement passes are
+// used to find how far the vehicle can move) — it never fabricates or
+// reuses stale ones.
 //
-// Honesty note: this is horizontal-collision + ground-contact resolution
-// via Rapier's contact solver, not a full mesh-accurate simulation —
-// Cesium's 3D Tiles renderer doesn't expose real-time triangle meshes to
-// the page, so a ring of height/occupancy samples around the vehicle
-// footprint is the practical way to get real, non-fabricated collision
-// data each frame.
-window.__rapierStatus = 'idle'; // 'idle' | 'loading' | 'ready' | 'unavailable'
-let RAPIER = null;
-let gp3dtWorld = null, gp3dtBody = null, gp3dtBodyCollider = null;
-let _gp3dtGroundColliders = [];
-
-async function ensureRapierLoaded() {
-    if (RAPIER) return RAPIER;
-    if (window.__rapierStatus === 'loading' || window.__rapierStatus === 'unavailable') return null;
-    window.__rapierStatus = 'loading';
-    try {
-        // Latest Rapier3D "compat" build — self-contained WASM + JS, works
-        // straight off a CDN via dynamic import(), no bundler/npm step needed.
-        const mod = await import('https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js');
-        await mod.init();
-        RAPIER = mod;
-        window.__rapierStatus = 'ready';
-        console.log('%c🧱 Rapier3D loaded (v0.14 compat/WASM)', 'color:#f59e0b;font-weight:bold');
-        return RAPIER;
-    } catch (err) {
-        console.warn('[Rapier3D] Failed to load from CDN — GP3DT collision unavailable:', err);
-        window.__rapierStatus = 'unavailable';
-        return null;
-    }
-}
-
-function vehicleColliderHalfExtents(vehicle) {
-    if (vehicle === 'car') return { hx: 0.95, hy: 0.70, hz: 2.20 };
-    if (vehicle === 'bus') return { hx: 1.30, hy: 1.60, hz: 5.50 };
-    return { hx: 1.80, hy: 1.40, hz: 6.00 }; // plane fuselage approximation
-}
-
-function initGP3DTCollisionWorld() {
-    if (!RAPIER) return false;
-    try {
-        gp3dtWorld = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
-        const ext = vehicleColliderHalfExtents(state.vehicle);
-        const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
-            .setTranslation(0, ext.hy + 0.3, 0)
-            .lockRotations()
-            .setLinearDamping(0.1)
-            .setCcdEnabled(true); // continuous collision — stops fast vehicles tunneling through a wall in one step
-        gp3dtBody = gp3dtWorld.createRigidBody(bodyDesc);
-        const colDesc = RAPIER.ColliderDesc.cuboid(ext.hx, ext.hy, ext.hz)
-            .setFriction(0.7).setRestitution(0.02);
-        gp3dtBodyCollider = gp3dtWorld.createCollider(colDesc, gp3dtBody);
-        _gp3dtGroundColliders = [];
-        return true;
-    } catch (err) {
-        console.warn('[Rapier3D] Failed to init GP3DT collision world:', err);
-        gp3dtWorld = null;
-        return false;
-    }
-}
-
-function teardownGP3DTCollisionWorld() {
-    _gp3dtGroundColliders = [];
-    gp3dtWorld = null; gp3dtBody = null; gp3dtBodyCollider = null;
-}
+// Method: binary-search, along the vehicle's intended displacement this
+// frame, for the furthest point at which every point in a small ring
+// around its footprint still reads within a small height tolerance of
+// the vehicle's own ground level. That furthest clear point is where the
+// vehicle actually ends up — i.e. it stops at a real wall/curb/building
+// face instead of passing through it, using nothing but sampleHeight().
 
 // ── Invisible ground-tracking plane (AGL) ──────────────────────────────
-// Lightweight, independent of the Rapier collision world above — just a
-// synchronous terrain-height probe plus the smoothing/throttle state used
+// Synchronous terrain-height probe plus the smoothing/throttle state used
 // by updateCesiumCamera() to compute real AGL every frame.
 let _groundPlaneSampleAccum = 0;
 let _groundPlaneTargetHeight = 0;
@@ -3248,32 +3185,6 @@ function sampleTerrainHeightMeters(lat, lng) {
     }
 }
 
-let _groundCollisionInitInFlight = false;
-
-/**
- * ensureGroundCollisionActive — lazily loads Rapier3D and initializes the
- * collision world the first time it's needed (3D Cesium mode with a real
- * tileset), then just keeps it running. Ground collision is a standard,
- * always-on part of driving/flying now — there is no manual toggle for it,
- * only the Precision slider (Settings → Physics), which trades sample
- * density for performance rather than turning collision off entirely.
- */
-function ensureGroundCollisionActive() {
-    if (gp3dtWorld || _groundCollisionInitInFlight) return;
-    if (!cesiumViewer || settings.renderMode !== '3D') return;
-    _groundCollisionInitInFlight = true;
-    const statusText = document.getElementById('ground-collision-status-text');
-    ensureRapierLoaded().then(mod => {
-        _groundCollisionInitInFlight = false;
-        if (!mod) {
-            if (statusText) statusText.textContent = 'Ground collision physics could not be loaded — using normal (non-collidable) movement.';
-            return;
-        }
-        if (!initGP3DTCollisionWorld()) return;
-        if (statusText) statusText.textContent = 'Active — colliding against live surface samples in Car, Bus, and Plane mode.';
-    });
-}
-
 /** updateGroundCollisionPrecision — Settings → Physics slider. */
 function updateGroundCollisionPrecision(val) {
     settings.groundCollisionPrecision = parseFloat(val);
@@ -3283,12 +3194,11 @@ function updateGroundCollisionPrecision(val) {
 }
 
 // Ring of sample points (meters, relative to vehicle-forward heading) used to
-// probe the real ground/surface height each frame. Center gives ground
-// height; the ring gives walls/buildings/terrain rises around the footprint.
+// probe the real ground/surface height each frame. The ring gives
+// walls/buildings/terrain rises around the vehicle's footprint.
 // Precision below 1.0 thins this ring out (cheaper, at the cost of missing
 // the odd small bump) rather than disabling collision altogether.
 const _GP3DT_SAMPLE_RING_FULL = [
-    { fwd: 0,   side: 0    },
     { fwd: 3.0, side: 0    }, { fwd: -3.0, side: 0    },
     { fwd: 2.2, side: 1.6  }, { fwd: 2.2, side: -1.6  },
     { fwd: -2.2, side: 1.6 }, { fwd: -2.2, side: -1.6 },
@@ -3297,29 +3207,56 @@ const _GP3DT_SAMPLE_RING_FULL = [
 function _activeSampleRing() {
     const p = Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision));
     if (p >= 1.0) return _GP3DT_SAMPLE_RING_FULL;
-    // Always keep the center (ground height) point; thin the outer ring
-    // proportionally to precision so the missing points don't cluster on
-    // one side of the vehicle.
-    const [center, ...ring] = _GP3DT_SAMPLE_RING_FULL;
-    const keep = Math.max(2, Math.round(ring.length * p));
-    const step = ring.length / keep;
+    // Thin the ring proportionally to precision so the missing points
+    // don't cluster on one side of the vehicle.
+    const keep = Math.max(2, Math.round(_GP3DT_SAMPLE_RING_FULL.length * p));
+    const step = _GP3DT_SAMPLE_RING_FULL.length / keep;
     const thinned = [];
-    for (let i = 0; i < keep; i++) thinned.push(ring[Math.floor(i * step)]);
-    return [center, ...thinned];
+    for (let i = 0; i < keep; i++) thinned.push(_GP3DT_SAMPLE_RING_FULL[Math.floor(i * step)]);
+    return thinned;
+}
+
+// How obstacle-clearance checks scale with the vehicle: a curb/step small
+// enough to be under this height (meters, above the vehicle's own ground
+// level) is treated as ground texture, not a wall — avoids the "gentle
+// slope feels like a wall" problem.
+function vehicleObstacleClearanceM(vehicle) {
+    if (vehicle === 'car') return 0.30;
+    if (vehicle === 'bus') return 0.35;
+    return 0.35; // plane — same as bus, only matters while on/near the ground
+}
+
+/**
+ * _footprintClear — true if every ring sample around (lat,lng), oriented
+ * along the vehicle's movement heading, reads within tolerance of
+ * originHeight (the vehicle's own ground level). False if a real surface
+ * (wall, building face, steep rise) is in the way at that position.
+ */
+function _footprintClear(scene, lat, lng, hdg, originHeight, tolerance, mPerDegLat, mPerDegLng) {
+    for (const p of _activeSampleRing()) {
+        const east  = p.fwd * Math.sin(hdg) + p.side * Math.cos(hdg);
+        const north = p.fwd * Math.cos(hdg) - p.side * Math.sin(hdg);
+        const sLat = lat + north / mPerDegLat;
+        const sLng = lng + east / mPerDegLng;
+        const h = scene.sampleHeight(Cesium.Cartographic.fromDegrees(sLng, sLat));
+        if (h === undefined || h === null) continue; // no real data here — skip, never guess
+        if (h - originHeight > tolerance) return false; // real obstacle rising above the vehicle's ground level
+    }
+    return true;
 }
 
 /**
  * applyGP3DTCollision — called once per frame from the main loop, after the
  * vehicle's normal (non-collidable) position update has produced a proposed
- * new state.lat/state.lng. Resolves that proposed move against real GP3DT
- * surface samples via Rapier3D and overwrites state.lat/state.lng with the
- * (possibly shortened, if something real was in the way) resolved result.
+ * new state.lat/state.lng. Binary-searches, purely from real sampleHeight()
+ * readings, how far along that proposed move the vehicle can actually go
+ * before a real surface blocks it, and overwrites state.lat/state.lng with
+ * the (possibly shortened) resolved result.
  *
  * prevLat/prevLng: vehicle position BEFORE this frame's normal integration.
  */
 function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
     if (!cesiumViewer || !photorealTileset || settings.renderMode !== '3D') return;
-    if (!gp3dtWorld) { ensureGroundCollisionActive(); return; } // not ready yet this frame — try again next frame
     // Planes only collide near the ground (taxi/takeoff/landing) — at
     // cruise altitude there's nothing meaningful under a 3-8m sample ring
     // and it would just waste sampleHeight calls every frame.
@@ -3327,58 +3264,40 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
 
     try {
         const scene = cesiumViewer.scene;
-        const originCarto = Cesium.Cartographic.fromDegrees(prevLng, prevLat);
-        const originHeight = scene.sampleHeight(originCarto);
+        const originHeight = scene.sampleHeight(Cesium.Cartographic.fromDegrees(prevLng, prevLat));
         if (originHeight === undefined || originHeight === null) return; // nothing real under us this frame — don't fabricate a floor
 
         const mPerDegLat = 111320;
         const mPerDegLng = 111320 * Math.cos(prevLat * Math.PI / 180);
 
-        // Rebuild ground/obstacle colliders fresh from this frame's real samples.
-        for (const c of _gp3dtGroundColliders) { try { gp3dtWorld.removeCollider(c, true); } catch (e) {} }
-        _gp3dtGroundColliders = [];
-
-        const hdg = prevHeadingRad;
-        for (const p of _activeSampleRing()) {
-            // Rotate the sample offset by vehicle heading into east/north meters.
-            const east  = p.fwd * Math.sin(hdg) + p.side * Math.cos(hdg);
-            const north = p.fwd * Math.cos(hdg) - p.side * Math.sin(hdg);
-            const sLat = prevLat + north / mPerDegLat;
-            const sLng = prevLng + east / mPerDegLng;
-            const h = scene.sampleHeight(Cesium.Cartographic.fromDegrees(sLng, sLat));
-            if (h === undefined || h === null) continue; // no real data here — skip, never guess
-
-            const localY = h - originHeight;
-            const desc = (p.fwd === 0 && p.side === 0)
-                // Center point: thin static floor, gives the vehicle real ground contact/friction.
-                ? RAPIER.ColliderDesc.cuboid(4, 0.1, 4).setTranslation(east, localY - 0.1, north).setFriction(0.8)
-                // Ring points: only becomes a solid obstacle if the real surface there rises meaningfully
-                // above the vehicle's own ground level (a curb, wall, or building face) — small bumps
-                // are ignored so gentle terrain doesn't feel like a wall.
-                : (localY > 0.35
-                    ? RAPIER.ColliderDesc.cuboid(0.6, Math.max(localY, 0.5) / 2 + 0.3, 0.6)
-                        .setTranslation(east, (localY / 2), north).setFriction(0.6)
-                    : null);
-            if (!desc) continue;
-            _gp3dtGroundColliders.push(gp3dtWorld.createCollider(desc));
-        }
-
-        // Desired displacement this frame, in local east/north meters — the
-        // delta between the normal (non-collidable) integration's result and
-        // our origin, expressed as a velocity so Rapier's solver can push
-        // back against it if a collider (above) is in the way.
         const desiredEast  = (state.lng - prevLng) * mPerDegLng;
         const desiredNorth = (state.lat - prevLat) * mPerDegLat;
-        const ext = vehicleColliderHalfExtents(state.vehicle);
-        gp3dtBody.setTranslation({ x: 0, y: ext.hy + 0.05, z: 0 }, true);
-        gp3dtBody.setLinvel({ x: desiredEast / Math.max(dt, 1e-4), y: -2, z: desiredNorth / Math.max(dt, 1e-4) }, true);
+        if (Math.hypot(desiredEast, desiredNorth) < 1e-6) return; // not moving — nothing to resolve
 
-        gp3dtWorld.timestep = dt;
-        gp3dtWorld.step();
+        const moveHdg = Math.atan2(desiredEast, desiredNorth);
+        const tolerance = vehicleObstacleClearanceM(state.vehicle);
 
-        const resolved = gp3dtBody.translation();
-        state.lat = prevLat + resolved.z / mPerDegLat;
-        state.lng = prevLng + resolved.x / mPerDegLng;
+        // Binary search the largest fraction (0..1) of the proposed move
+        // that still keeps the footprint clear — a handful of real samples
+        // converges quickly. Precision scales how many refinement passes
+        // we spend (fewer passes = coarser stopping point, cheaper frame).
+        const passes = Math.round(2 + 3 * Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision)));
+        let frac = 1, allowedFrac = 0, step = 0.5;
+        for (let i = 0; i < passes; i++) {
+            const testLat = prevLat + (desiredNorth * frac) / mPerDegLat;
+            const testLng = prevLng + (desiredEast * frac) / mPerDegLng;
+            if (_footprintClear(scene, testLat, testLng, moveHdg, originHeight, tolerance, mPerDegLat, mPerDegLng)) {
+                allowedFrac = frac;
+                frac += step;
+            } else {
+                frac -= step;
+            }
+            step /= 2;
+            frac = Math.max(0, Math.min(1, frac));
+        }
+
+        state.lat = prevLat + (desiredNorth * allowedFrac) / mPerDegLat;
+        state.lng = prevLng + (desiredEast * allowedFrac) / mPerDegLng;
     } catch (err) {
         // Never let a collision-step failure stall the game loop — fall
         // back to whatever the normal integrator already produced.
