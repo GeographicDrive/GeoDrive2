@@ -3140,50 +3140,91 @@ function ensureFlightSim(reseed) {
 }
 
 // ==========================================
-// GROUND COLLISION — Rapier3D
+// GROUND COLLISION
 // ==========================================
 // Ground/surface collision for Car, Bus, and Plane — always active while
 // in 3D Cesium mode (no toggle; see Settings → Physics for the Precision
-// slider). Every frame we raycast straight down (Cesium's synchronous
-// scene.sampleHeight, which reads whatever is actually rendered — GP3DT
-// tiles, OSM Buildings, or terrain) at a small ring of points around the
-// vehicle to measure the REAL surface around it, and use those readings
-// directly to resolve the frame's intended move — no physics engine
-// involved, just real height samples compared against each other.
+// slider).
+//
+// This does NOT use scene.sampleHeight(). sampleHeight() is a single
+// synchronous ray cast per call — calling it many times per frame (once
+// per ring point, per binary-search pass) means many separate scene
+// traversals every frame, which is the expensive part.
+//
+// Instead, real height readings are fetched with scene.clampToHeightMostDetailed(),
+// which takes a whole batch of points and resolves them in ONE scene
+// traversal — Cesium's own recommended API for "I need many real heights,
+// as cheaply as possible", as opposed to sampleHeight's "I need one height,
+// right now, blocking". Results are cached per small grid cell so that on
+// a typical frame nothing touches the scene at all — collision/AGL checks
+// just read a plain object lookup — and a new batched request only goes
+// out when the vehicle moves into cells that haven't been sampled yet (or
+// a cached cell has gone stale). The Precision slider controls the grid
+// cell size and how much of the surrounding ring is checked, trading
+// resolution for how often (and how large) those batches need to be.
 //
 // Deliberately NOT done: no static/precomputed collision mesh, no
 // approximate bounding boxes placed "because a building is probably
-// there", no third-party physics library. Every sample used this frame
-// is taken fresh this frame and thrown away — so there is nothing left
-// lying around to become an invisible spike or wall if the tileset
-// streams in more/less detail later. The Precision slider only changes
-// how many real samples are taken (and how many refinement passes are
-// used to find how far the vehicle can move) — it never fabricates or
-// reuses stale ones.
-//
-// Method: binary-search, along the vehicle's intended displacement this
-// frame, for the furthest point at which every point in a small ring
-// around its footprint still reads within a small height tolerance of
-// the vehicle's own ground level. That furthest clear point is where the
-// vehicle actually ends up — i.e. it stops at a real wall/curb/building
-// face instead of passing through it, using nothing but sampleHeight().
+// there", no third-party physics library. Every cached height came from a
+// real batched query and expires on its own (TTL below) — nothing is
+// fabricated, and nothing sticks around long enough to become a stale
+// invisible spike or wall if the tileset streams in more/less detail.
+
+// ── Height cache (batched, async — replaces per-point sampleHeight) ────
+const _HEIGHT_CELL_M = 2.0;       // grid cell size, meters
+const _HEIGHT_CACHE_TTL = 4.0;    // seconds before a cached cell is refreshed
+const _heightCache = new Map();   // "cellLat,cellLng" -> { height, t }
+const _heightPending = new Set(); // cell keys with an in-flight batch request already queued
+
+function _heightCellKey(lat, lng, mPerDegLat, mPerDegLng) {
+    const cellDegLat = _HEIGHT_CELL_M / mPerDegLat;
+    const cellDegLng = _HEIGHT_CELL_M / mPerDegLng;
+    return Math.round(lat / cellDegLat) + ',' + Math.round(lng / cellDegLng);
+}
+
+/** _getCachedHeight — instant, no scene access. Returns null on a cold cache miss. */
+function _getCachedHeight(lat, lng, mPerDegLat, mPerDegLng) {
+    const entry = _heightCache.get(_heightCellKey(lat, lng, mPerDegLat, mPerDegLng));
+    return entry ? entry.height : null;
+}
+
+/**
+ * _queueHeightRequests — batches every point whose cell is missing or
+ * stale into a single clampToHeightMostDetailed() call. Never blocks the
+ * calling frame; results land in the cache for a later frame to read.
+ */
+function _queueHeightRequests(points, mPerDegLat, mPerDegLng) {
+    if (!cesiumViewer || typeof cesiumViewer.scene.clampToHeightMostDetailed !== 'function') return;
+    const now = performance.now() / 1000;
+    const needPts = [], needKeys = [];
+    for (const pt of points) {
+        const key = _heightCellKey(pt.lat, pt.lng, mPerDegLat, mPerDegLng);
+        if (_heightPending.has(key)) continue;
+        const entry = _heightCache.get(key);
+        if (entry && (now - entry.t) <= _HEIGHT_CACHE_TTL) continue;
+        needPts.push(pt); needKeys.push(key);
+    }
+    if (!needPts.length) return;
+    for (const k of needKeys) _heightPending.add(k);
+
+    const cartesians = needPts.map(pt => Cesium.Cartesian3.fromDegrees(pt.lng, pt.lat, 0));
+    cesiumViewer.scene.clampToHeightMostDetailed(cartesians).then(results => {
+        const t = performance.now() / 1000;
+        for (let i = 0; i < results.length; i++) {
+            _heightPending.delete(needKeys[i]);
+            const c = results[i];
+            if (!c) continue;
+            const carto = Cesium.Cartographic.fromCartesian(c);
+            if (!carto) continue;
+            _heightCache.set(needKeys[i], { height: carto.height, t });
+        }
+    }).catch(() => {
+        for (const k of needKeys) _heightPending.delete(k);
+    });
+}
 
 // ── Invisible ground-tracking plane (AGL) ──────────────────────────────
-// Synchronous terrain-height probe plus the smoothing/throttle state used
-// by updateCesiumCamera() to compute real AGL every frame.
-let _groundPlaneSampleAccum = 0;
-let _groundPlaneTargetHeight = 0;
 let _groundPlaneSmoothedHeight = null;
-
-function sampleTerrainHeightMeters(lat, lng) {
-    if (!cesiumViewer || settings.renderMode !== '3D') return 0;
-    try {
-        const h = cesiumViewer.scene.sampleHeight(Cesium.Cartographic.fromDegrees(lng, lat));
-        return (h === undefined || h === null) ? null : h;
-    } catch (err) {
-        return null;
-    }
-}
 
 /** updateGroundCollisionPrecision — Settings → Physics slider. */
 function updateGroundCollisionPrecision(val) {
@@ -3194,10 +3235,9 @@ function updateGroundCollisionPrecision(val) {
 }
 
 // Ring of sample points (meters, relative to vehicle-forward heading) used to
-// probe the real ground/surface height each frame. The ring gives
-// walls/buildings/terrain rises around the vehicle's footprint.
-// Precision below 1.0 thins this ring out (cheaper, at the cost of missing
-// the odd small bump) rather than disabling collision altogether.
+// probe the real ground/surface height around the vehicle's footprint.
+// Precision below 1.0 thins this ring out (cheaper batches, at the cost of
+// missing the odd small bump) rather than disabling collision altogether.
 const _GP3DT_SAMPLE_RING_FULL = [
     { fwd: 3.0, side: 0    }, { fwd: -3.0, side: 0    },
     { fwd: 2.2, side: 1.6  }, { fwd: 2.2, side: -1.6  },
@@ -3207,8 +3247,6 @@ const _GP3DT_SAMPLE_RING_FULL = [
 function _activeSampleRing() {
     const p = Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision));
     if (p >= 1.0) return _GP3DT_SAMPLE_RING_FULL;
-    // Thin the ring proportionally to precision so the missing points
-    // don't cluster on one side of the vehicle.
     const keep = Math.max(2, Math.round(_GP3DT_SAMPLE_RING_FULL.length * p));
     const step = _GP3DT_SAMPLE_RING_FULL.length / keep;
     const thinned = [];
@@ -3227,31 +3265,12 @@ function vehicleObstacleClearanceM(vehicle) {
 }
 
 /**
- * _footprintClear — true if every ring sample around (lat,lng), oriented
- * along the vehicle's movement heading, reads within tolerance of
- * originHeight (the vehicle's own ground level). False if a real surface
- * (wall, building face, steep rise) is in the way at that position.
- */
-function _footprintClear(scene, lat, lng, hdg, originHeight, tolerance, mPerDegLat, mPerDegLng) {
-    for (const p of _activeSampleRing()) {
-        const east  = p.fwd * Math.sin(hdg) + p.side * Math.cos(hdg);
-        const north = p.fwd * Math.cos(hdg) - p.side * Math.sin(hdg);
-        const sLat = lat + north / mPerDegLat;
-        const sLng = lng + east / mPerDegLng;
-        const h = scene.sampleHeight(Cesium.Cartographic.fromDegrees(sLng, sLat));
-        if (h === undefined || h === null) continue; // no real data here — skip, never guess
-        if (h - originHeight > tolerance) return false; // real obstacle rising above the vehicle's ground level
-    }
-    return true;
-}
-
-/**
  * applyGP3DTCollision — called once per frame from the main loop, after the
  * vehicle's normal (non-collidable) position update has produced a proposed
- * new state.lat/state.lng. Binary-searches, purely from real sampleHeight()
- * readings, how far along that proposed move the vehicle can actually go
- * before a real surface blocks it, and overwrites state.lat/state.lng with
- * the (possibly shortened) resolved result.
+ * new state.lat/state.lng. Checks the cached heights around the proposed
+ * footprint (an instant Map lookup, no scene access) and blocks the move
+ * for this frame if a real surface is in the way; any cells that are
+ * missing/stale get queued as one batched request for future frames.
  *
  * prevLat/prevLng: vehicle position BEFORE this frame's normal integration.
  */
@@ -3259,50 +3278,51 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
     if (!cesiumViewer || !photorealTileset || settings.renderMode !== '3D') return;
     // Planes only collide near the ground (taxi/takeoff/landing) — at
     // cruise altitude there's nothing meaningful under a 3-8m sample ring
-    // and it would just waste sampleHeight calls every frame.
+    // and it would just queue pointless height requests every frame.
     if (isPlaneType(state.vehicle) && (flight.alt || 0) > 500) return;
 
-    try {
-        const scene = cesiumViewer.scene;
-        const originHeight = scene.sampleHeight(Cesium.Cartographic.fromDegrees(prevLng, prevLat));
-        if (originHeight === undefined || originHeight === null) return; // nothing real under us this frame — don't fabricate a floor
+    const mPerDegLat = 111320;
+    const mPerDegLng = 111320 * Math.cos(prevLat * Math.PI / 180);
 
-        const mPerDegLat = 111320;
-        const mPerDegLng = 111320 * Math.cos(prevLat * Math.PI / 180);
+    const originHeight = _getCachedHeight(prevLat, prevLng, mPerDegLat, mPerDegLng);
 
-        const desiredEast  = (state.lng - prevLng) * mPerDegLng;
-        const desiredNorth = (state.lat - prevLat) * mPerDegLat;
-        if (Math.hypot(desiredEast, desiredNorth) < 1e-6) return; // not moving — nothing to resolve
+    const desiredEast  = (state.lng - prevLng) * mPerDegLng;
+    const desiredNorth = (state.lat - prevLat) * mPerDegLat;
+    const moving = Math.hypot(desiredEast, desiredNorth) >= 1e-6;
+    const moveHdg = moving ? Math.atan2(desiredEast, desiredNorth) : prevHeadingRad;
 
-        const moveHdg = Math.atan2(desiredEast, desiredNorth);
-        const tolerance = vehicleObstacleClearanceM(state.vehicle);
+    // Ring points, at the vehicle's PROPOSED new position, oriented along
+    // its direction of travel — these are what we need cached to decide
+    // whether this frame's move is clear.
+    const ringPts = _activeSampleRing().map(p => {
+        const east  = p.fwd * Math.sin(moveHdg) + p.side * Math.cos(moveHdg);
+        const north = p.fwd * Math.cos(moveHdg) - p.side * Math.sin(moveHdg);
+        return { lat: state.lat + north / mPerDegLat, lng: state.lng + east / mPerDegLng };
+    });
 
-        // Binary search the largest fraction (0..1) of the proposed move
-        // that still keeps the footprint clear — a handful of real samples
-        // converges quickly. Precision scales how many refinement passes
-        // we spend (fewer passes = coarser stopping point, cheaper frame).
-        const passes = Math.round(2 + 3 * Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision)));
-        let frac = 1, allowedFrac = 0, step = 0.5;
-        for (let i = 0; i < passes; i++) {
-            const testLat = prevLat + (desiredNorth * frac) / mPerDegLat;
-            const testLng = prevLng + (desiredEast * frac) / mPerDegLng;
-            if (_footprintClear(scene, testLat, testLng, moveHdg, originHeight, tolerance, mPerDegLat, mPerDegLng)) {
-                allowedFrac = frac;
-                frac += step;
-            } else {
-                frac -= step;
-            }
-            step /= 2;
-            frac = Math.max(0, Math.min(1, frac));
-        }
+    // Queue a single batched request for anything missing/stale (origin +
+    // ring together) — this is the only place the scene actually gets
+    // touched, and only for the cells we don't already have a fresh
+    // reading for.
+    _queueHeightRequests([{ lat: prevLat, lng: prevLng }, ...ringPts], mPerDegLat, mPerDegLng);
 
-        state.lat = prevLat + (desiredNorth * allowedFrac) / mPerDegLat;
-        state.lng = prevLng + (desiredEast * allowedFrac) / mPerDegLng;
-    } catch (err) {
-        // Never let a collision-step failure stall the game loop — fall
-        // back to whatever the normal integrator already produced.
-        console.warn('[Ground Collision] step failed, leaving movement uncollided this frame:', err);
+    if (originHeight === null) return; // nothing cached under us yet — request is queued, try again once it lands
+
+    const tolerance = vehicleObstacleClearanceM(state.vehicle);
+    let blocked = false;
+    for (const pt of ringPts) {
+        const h = _getCachedHeight(pt.lat, pt.lng, mPerDegLat, mPerDegLng);
+        if (h === null) continue; // not cached yet — request already queued above; don't guess, don't block on it
+        if (h - originHeight > tolerance) { blocked = true; break; }
     }
+
+    if (blocked) {
+        // A real surface is in the way this frame — hold at the previous
+        // position rather than passing through it.
+        state.lat = prevLat;
+        state.lng = prevLng;
+    }
+    // Otherwise state.lat/lng already carries the normal integrator's move.
 }
 
 const flight = {
@@ -5316,26 +5336,21 @@ function updateCesiumCamera(dt) {
     // ground plane; when they're at the same horizontal position and the
     // real plane settles onto it, that's ground contact (taxi/landing).
     //
-    // Sampling the real terrain every frame is the accurate way to do
-    // this, but scene.sampleHeight() isn't free — so how often we
-    // resample is throttled by settings.groundCollisionPrecision (Settings
-    // → Physics). At full precision we resample every frame; at lower
-    // precision we resample less often and smoothly interpolate toward
-    // the new reading in between, which avoids the "invisible bump" you'd
-    // get from just snapping to a stale sample.
-    _groundPlaneSampleAccum += dt;
-    const _precision = Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision));
-    const _sampleInterval = (1 - _precision) * 0.4; // seconds; 0 at full precision
-    if (_groundPlaneSampleAccum >= _sampleInterval) {
-        _groundPlaneSampleAccum = 0;
-        const sampled = sampleTerrainHeightMeters(state.lat, state.lng);
-        if (sampled !== null) _groundPlaneTargetHeight = sampled;
-    }
-    if (_groundPlaneSmoothedHeight === null) {
-        _groundPlaneSmoothedHeight = _groundPlaneTargetHeight;
-    } else {
-        const alpha = 1 - Math.exp(-10 * dt);
-        _groundPlaneSmoothedHeight += (_groundPlaneTargetHeight - _groundPlaneSmoothedHeight) * alpha;
+    // The reading comes from the same cached/batched height system as
+    // ground collision (_getCachedHeight / _queueHeightRequests) — an
+    // instant Map lookup, not a live scene raycast. If the current cell
+    // hasn't been queried yet (or has gone stale) a batched request is
+    // queued and we keep the last known reading until it lands, smoothly
+    // interpolating toward the new one so a cache update never shows up
+    // as an "invisible bump".
+    {
+        const _mPerDegLat = 111320;
+        const _mPerDegLng = 111320 * Math.cos(state.lat * Math.PI / 180);
+        _queueHeightRequests([{ lat: state.lat, lng: state.lng }], _mPerDegLat, _mPerDegLng);
+        const cached = _getCachedHeight(state.lat, state.lng, _mPerDegLat, _mPerDegLng);
+        if (cached !== null) _groundPlaneSmoothedHeight = (_groundPlaneSmoothedHeight === null)
+            ? cached
+            : _groundPlaneSmoothedHeight + (cached - _groundPlaneSmoothedHeight) * (1 - Math.exp(-10 * dt));
     }
     const groundHeight = _groundPlaneSmoothedHeight || 0;
     // groundRef IS the invisible ground plane's current height — updated
