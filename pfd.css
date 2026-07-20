@@ -1,0 +1,82 @@
+/* ── A320 Primary Flight Display (PFD) — floating, draggable, minimizable ── */
+#pfd-window {
+    position: fixed;
+    top: 90px;
+    left: 20px;
+    width: 380px;
+    z-index: 4000;
+    background: #0a0d12;
+    border: 2px solid #3a4552;
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.55);
+    font-family: 'Segoe UI', Arial, sans-serif;
+    user-select: none;
+    display: none; /* shown only in plane mode via JS */
+}
+#pfd-window.pfd-hidden { display: none !important; }
+
+#pfd-titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: linear-gradient(180deg, #1c242e, #12171d);
+    border-bottom: 1px solid #3a4552;
+    border-radius: 8px 8px 0 0;
+    cursor: grab;
+    touch-action: none;
+}
+#pfd-titlebar:active { cursor: grabbing; }
+#pfd-titlebar .pfd-title {
+    color: #7fd3ff;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+#pfd-titlebar .pfd-btns { display: flex; gap: 6px; }
+#pfd-titlebar button {
+    width: 22px; height: 22px;
+    border-radius: 4px;
+    border: 1px solid #3a4552;
+    background: #202a34;
+    color: #cfe8ff;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+}
+#pfd-titlebar button:hover { background: #2c3947; }
+
+#pfd-body { padding: 6px; }
+#pfd-window.pfd-minimized #pfd-body { display: none; }
+#pfd-window.pfd-minimized { width: 230px; }
+
+#pfd-canvas-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #000;
+}
+#pfd-canvas { width: 100%; height: 100%; display: block; }
+
+#pfd-resize-handle {
+    position: absolute;
+    right: 4px; bottom: 4px;
+    width: 14px; height: 14px;
+    cursor: nwse-resize;
+    opacity: 0.5;
+}
+#pfd-resize-handle svg { width: 100%; height: 100%; }
+
+#pfd-footer {
+    display: flex;
+    justify-content: space-between;
+    padding: 5px 8px 7px;
+    font-size: 10px;
+    color: #7f97ab;
+    letter-spacing: .5px;
+}
+#pfd-footer span.pfd-warn { color: #ff5050; font-weight: 700; }
+#pfd-footer span.pfd-amber { color: #ffb400; font-weight: 700; }
