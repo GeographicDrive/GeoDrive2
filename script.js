@@ -3264,6 +3264,22 @@ function vehicleObstacleClearanceM(vehicle) {
     return 0.35; // plane — same as bus, only matters while on/near the ground
 }
 
+// ── GP3DT check throttling ─────────────────────────────────────────────
+// The ring-sample + clampToHeightMostDetailed work below is real raycasting
+// against the streamed photorealistic tiles — not free. Most of the 0-500ft
+// band has essentially zero real collision risk (that only becomes likely
+// close to the ground during taxi/takeoff/landing), so we check far less
+// often the higher within that band a plane is, and only go back to a
+// full every-frame check once it's genuinely close to the surface. This is
+// what keeps FPS high while still descending/climbing through that band.
+let _gp3dtAccum = 0;
+function _gp3dtCheckIntervalSec(vehicle, aglFt) {
+    if (!isPlaneType(vehicle)) return 0;      // cars/buses: always check, they're always near the ground
+    if (aglFt > 350) return 0.20;             // ~5x/sec — plenty this high
+    if (aglFt > 150) return 0.08;             // ~12x/sec — approach/climb-out
+    return 0;                                  // near the ground: every frame, full precision
+}
+
 /**
  * applyGP3DTCollision — called once per frame from the main loop, after the
  * vehicle's normal (non-collidable) position update has produced a proposed
@@ -3279,7 +3295,16 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
     // Planes only collide near the ground (taxi/takeoff/landing) — at
     // cruise altitude there's nothing meaningful under a 3-8m sample ring
     // and it would just queue pointless height requests every frame.
-    if (isPlaneType(state.vehicle) && (flight.alt || 0) > 500) return;
+    if (isPlaneType(state.vehicle) && (flight.alt || 0) > 500) { _gp3dtAccum = 0; return; }
+
+    // Throttle: skip the expensive ring-sample/clamp work on most frames
+    // when we're higher within the 500ft band (see _gp3dtCheckIntervalSec).
+    // The plane keeps moving normally in between checks — we're just not
+    // spending a raycast batch on every single one of those frames.
+    _gp3dtAccum += dt;
+    const _gp3dtInterval = _gp3dtCheckIntervalSec(state.vehicle, flight.alt || 0);
+    if (_gp3dtAccum < _gp3dtInterval) return;
+    _gp3dtAccum = 0;
 
     const mPerDegLat = 111320;
     const mPerDegLng = 111320 * Math.cos(prevLat * Math.PI / 180);
@@ -3293,8 +3318,15 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
 
     // Ring points, at the vehicle's PROPOSED new position, oriented along
     // its direction of travel — these are what we need cached to decide
-    // whether this frame's move is clear.
-    const ringPts = _activeSampleRing().map(p => {
+    // whether this frame's move is clear. Above 150ft AGL we also thin the
+    // ring further on top of the manual precision slider, same reasoning
+    // as the check-interval throttle above: less real risk that high, so
+    // fewer raycasts needed to catch it.
+    let _ring = _activeSampleRing();
+    if (isPlaneType(state.vehicle) && (flight.alt || 0) > 150 && _ring.length > 4) {
+        _ring = [_ring[0], _ring[1], _ring[2], _ring[3]];
+    }
+    const ringPts = _ring.map(p => {
         const east  = p.fwd * Math.sin(moveHdg) + p.side * Math.cos(moveHdg);
         const north = p.fwd * Math.cos(moveHdg) - p.side * Math.sin(moveHdg);
         return { lat: state.lat + north / mPerDegLat, lng: state.lng + east / mPerDegLng };
@@ -3309,12 +3341,19 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
     if (originHeight === null) return; // nothing cached under us yet — request is queued, try again once it lands
 
     const tolerance = vehicleObstacleClearanceM(state.vehicle);
-    let blocked = false;
+    let hitCount = 0;
     for (const pt of ringPts) {
         const h = _getCachedHeight(pt.lat, pt.lng, mPerDegLat, mPerDegLng);
         if (h === null) continue; // not cached yet — request already queued above; don't guess, don't block on it
-        if (h - originHeight > tolerance) { blocked = true; break; }
+        if (h - originHeight > tolerance) hitCount++;
     }
+    // Require at least 2 independent sample points to agree before treating
+    // it as a real obstacle. A single point spiking is almost always a
+    // photorealistic tile still streaming in at a coarser LOD settling into
+    // place, not an actual wall — and blocking on just one of those is what
+    // caused the plane to appear to stop dead in open air. A genuine wall or
+    // rising terrain shows up consistently across neighboring sample points.
+    const blocked = hitCount >= 2;
 
     if (blocked) {
         // A real surface is in the way this frame — hold at the previous
