@@ -3172,7 +3172,7 @@ function ensureFlightSim(reseed) {
 
 // ── Height cache (batched, async — replaces per-point sampleHeight) ────
 const _HEIGHT_CELL_M = 2.0;       // grid cell size, meters
-const _HEIGHT_CACHE_TTL = 4.0;    // seconds before a cached cell is refreshed
+const _HEIGHT_CACHE_TTL = 10.0;   // seconds before a cached cell is refreshed
 const _heightCache = new Map();   // "cellLat,cellLng" -> { height, t }
 const _heightPending = new Set(); // cell keys with an in-flight batch request already queued
 
@@ -5387,9 +5387,28 @@ function updateCesiumCamera(dt) {
         const _mPerDegLng = 111320 * Math.cos(state.lat * Math.PI / 180);
         _queueHeightRequests([{ lat: state.lat, lng: state.lng }], _mPerDegLat, _mPerDegLng);
         const cached = _getCachedHeight(state.lat, state.lng, _mPerDegLat, _mPerDegLng);
-        if (cached !== null) _groundPlaneSmoothedHeight = (_groundPlaneSmoothedHeight === null)
-            ? cached
-            : _groundPlaneSmoothedHeight + (cached - _groundPlaneSmoothedHeight) * (1 - Math.exp(-10 * dt));
+        if (cached !== null) {
+            if (_groundPlaneSmoothedHeight === null) {
+                _groundPlaneSmoothedHeight = cached;
+            } else {
+                // Gentler smoothing (was rate 10 -> ~63% closed in 0.1s;
+                // now rate 2.5 -> ~63% closed in 0.4s) so a cache refresh
+                // that returns a different height (common with streamed
+                // GP3DT tiles settling into a different LOD) doesn't show
+                // up as a sudden "elevator" step.
+                const target = cached;
+                const smoothed = _groundPlaneSmoothedHeight + (target - _groundPlaneSmoothedHeight) * (1 - Math.exp(-2.5 * dt));
+                // Extra safety clamp: never let the ground reference move
+                // more than 1.5 m per second, regardless of how big the
+                // jump in the raw reading was. Real terrain never moves;
+                // large deltas are LOD/streaming noise, not genuine relief,
+                // so this caps the visible correction speed without ever
+                // freezing it.
+                const maxStep = 1.5 * dt;
+                const delta = smoothed - _groundPlaneSmoothedHeight;
+                _groundPlaneSmoothedHeight += Math.max(-maxStep, Math.min(maxStep, delta));
+            }
+        }
     }
     const groundHeight = _groundPlaneSmoothedHeight || 0;
     // groundRef IS the invisible ground plane's current height — updated
