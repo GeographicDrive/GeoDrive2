@@ -230,8 +230,10 @@
                     <label style="margin-top: 12px;">3D Style <span style="font-weight:400;">— only takes effect once a token below is saved</span></label>
                     <div style="display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap;">
                         <button id="btn-style-cesium" class="btn-ui" onclick="set3DStyle('cesium')" style="flex:1;">🗺️ World Terrain + OSM</button>
+                        <button id="btn-style-hybrid" class="btn-ui" onclick="set3DStyle('hybrid')" style="flex:1;">🌍✈️ Terrain + Airports GP3DT</button>
                         <button id="btn-style-photoreal" class="btn-ui active" onclick="set3DStyle('photoreal')" style="flex:1;">🌆 Google Photorealistic</button>
                     </div>
+                    <p class="desc-text" style="margin-top:6px;">"Terrain + Airports GP3DT" loads real World Terrain everywhere and only switches to Google's photorealistic 3D tiles inside a radius around whichever airport is nearby — best of both: light everywhere, ultra-detailed right where you land/takeoff.</p>
                     <label style="margin-top: 12px;">Cesium Ion Token <span style="font-weight:400;">(optional — this app already includes one)</span></label>
                     <div style="display:flex; gap:8px; margin-top:6px;">
                         <input type="text" id="cesium-token-input" placeholder="eyJhbGci..." style="flex:1; font-size:0.75rem; padding:6px;">

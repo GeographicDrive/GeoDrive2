@@ -4219,6 +4219,26 @@ function initCesium() {
         cesiumViewer.scene.sun.show = true;
         cesiumViewer.scene.moon.show = false;
 
+        // ── Vehicle-only shadows ────────────────────────────────────────
+        // The shadow map system is enabled scene-wide (required by Cesium
+        // for *any* primitive to cast/receive a shadow), but terrain
+        // explicitly opts out via its own `.shadows` property, and every
+        // 3D-tile layer (GP3DT, OSM Buildings) is set the same way as soon
+        // as it loads — see tryLoadPhotorealisticTiles() / tryLoadOsmBuildings().
+        // Net effect: only the vehicle GLB model (set to
+        // Cesium.ShadowMode.ENABLED in buildVehicleModels) casts and
+        // receives shadows — self-shadowing on the fuselage/tail like the
+        // reference screenshots — while terrain, OSM Buildings and Google
+        // Photorealistic 3D Tiles stay completely unaffected: no shadow
+        // cast onto the ground/buildings, none received from them either.
+        cesiumViewer.shadows = true;
+        cesiumViewer.shadowMap.softShadows     = true;  // soft-edged, not a hard pixelated cutoff
+        cesiumViewer.shadowMap.size            = 2048;  // sharp self-shadow on the model
+        cesiumViewer.shadowMap.darkness        = 0.35;  // shaded side stays ambient-lit, never pure black
+        cesiumViewer.shadowMap.maximumDistance = 2000;   // only needs to cover the immediate vehicle area
+        cesiumViewer.scene.globe.shadows        = Cesium.ShadowMode.DISABLED;
+        cesiumViewer.scene.globe.receiveShadows = false;
+
         // Disable all built-in Cesium globe interaction so that clicking or
         // dragging anywhere on the canvas (outside of UI buttons) doesn't
         // rotate/tilt/zoom/translate the globe. The camera is driven entirely
@@ -4351,9 +4371,12 @@ function applyGP3DTQualitySettings() {
     cesiumViewer.scene.fog.density = gp3dtSettings.fogDensity;
     cesiumViewer.scene.fog.enabled = gp3dtSettings.fogDensity > 0;
 
-    // Scene-wide: shadows — removed entirely (feature deleted per request).
-    cesiumViewer.shadows = false;
+    // Scene-wide shadows: kept ON (vehicle-only shadows — see initCesium).
+    // Terrain must stay excluded regardless of which quality preset is
+    // active, so it's re-asserted here too.
+    cesiumViewer.shadows = true;
     cesiumViewer.terrainShadows = Cesium.ShadowMode.DISABLED;
+    cesiumViewer.scene.globe.shadows = Cesium.ShadowMode.DISABLED;
 
     console.log(
         `%c🎨 GP3DT quality applied: ${GP3DT_PRESETS[gp3dtSettings.preset]?.name ?? 'Custom'} ` +
@@ -4478,6 +4501,9 @@ function tryLoadPhotorealisticTiles() {
                 if (photorealTileset) cesiumViewer.scene.primitives.remove(photorealTileset);
                 cesiumViewer.scene.primitives.add(tileset);
                 photorealTileset = tileset;
+                // Vehicle-only shadows: GP3DT buildings/terrain mesh must
+                // neither cast nor receive shadows from the vehicle model.
+                photorealTileset.shadows = Cesium.ShadowMode.DISABLED;
                 // Apply occlusion / view-frustum culling to match current toggle
                 photorealTileset.cullWithChildrenBounds = settings.occlusionCulling;
                 // Apply grid-square, no-memory culling (only render the squares
@@ -4555,9 +4581,166 @@ function tryLoadPhotorealisticTiles() {
     }
 }
 
+// ==========================================
+// 7a-1b. HYBRID MODE — WORLD TERRAIN EVERYWHERE + GP3DT ONLY AT AIRPORTS
+// ==========================================
+// mapStyle 'hybrid': the globe renders real Cesium World Terrain elevation
+// everywhere (exactly like 'cesium' style), and the Google Photorealistic
+// 3D Tileset (GP3DT) is also loaded — but clipped with a
+// Cesium.ClippingPolygonCollection so it only ever draws INSIDE a circle
+// around each airport near the camera. Everywhere else GP3DT is invisible
+// and World Terrain shows through instead.
+//
+// Height alignment: both World Terrain and GP3DT are real, elevation-
+// accurate datasets referenced to the same WGS84 ellipsoid — GP3DT's mesh
+// already sits at the true ground height, same as World Terrain's DEM — so
+// they naturally meet at the same altitude at the edge of the clip circle;
+// there's no separate "float above / sink below" offset to apply. What DOES
+// cause an apparent seam is z-fighting between the two surfaces, which is
+// why depthTestAgainstTerrain (see toggleOcclusionCulling) must stay on
+// while this mode is active — that's what's keeping GP3DT correctly in
+// front of/behind the terrain mesh at the boundary instead of flickering.
+const HYBRID_AIRPORT_RADIUS_M = 3000;  // meters — GP3DT circle radius per airport; big enough to cover the whole airfield (runways+taxiways+terminal) plus a little buffer
+const HYBRID_REFRESH_DIST_M   = 5000;  // camera must travel this far before we recompute nearby airports / rebuild the clip circles
+const HYBRID_NEARBY_RANGE_M   = 60000; // only clip in airports within this range of the camera — keeps the polygon count (and clipping cost) small
+
+let hybridTileset             = null;
+let _hybridMoveEndHandler     = null;
+let _hybridLastCameraPos      = null;
+
+// Builds a circle (as a polygon) of `sides` points around lat/lng at the
+// given radius in meters — used as one ClippingPolygon per nearby airport.
+function _hybridCirclePositions(lat, lng, radiusM, sides = 32) {
+    const positions = [];
+    const latRad = lat * Math.PI / 180;
+    for (let i = 0; i < sides; i++) {
+        const angle = (i / sides) * 2 * Math.PI;
+        const dLat = (radiusM * Math.cos(angle)) / 111320;
+        const dLng = (radiusM * Math.sin(angle)) / (111320 * Math.cos(latRad));
+        positions.push(Cesium.Cartesian3.fromDegrees(lng + dLng, lat + dLat));
+    }
+    return positions;
+}
+
+// Returns the airports (of any spawnable type) within HYBRID_NEARBY_RANGE_M
+// of the camera's current world position.
+function _hybridNearbyAirports() {
+    if (!cesiumViewer || typeof AirportDB === 'undefined' || !AirportDB.isLoaded()) return [];
+    const camPos  = cesiumViewer.camera.positionWC;
+    const carto   = Cesium.Cartographic.fromCartesian(camPos);
+    const lat     = Cesium.Math.toDegrees(carto.latitude);
+    const lng     = Cesium.Math.toDegrees(carto.longitude);
+    const dLatDeg = HYBRID_NEARBY_RANGE_M / 111320;
+    const dLngDeg = HYBRID_NEARBY_RANGE_M / (111320 * Math.cos(lat * Math.PI / 180));
+    const types   = new Set(['large_airport', 'medium_airport', 'small_airport', 'military', 'heliport', 'seaplane_base']);
+    // Coarse bounding-box prefilter, then an exact 3D distance check (the
+    // box is rectangular in lat/lng so it over-includes at the corners).
+    const candidates = AirportDB.getByBounds(lat - dLatDeg, lng - dLngDeg, lat + dLatDeg, lng + dLngDeg, types);
+    return candidates.filter(ap =>
+        Cesium.Cartesian3.distance(camPos, Cesium.Cartesian3.fromDegrees(ap.lng, ap.lat)) <= HYBRID_NEARBY_RANGE_M * 1.5
+    );
+}
+
+// Rebuilds the tileset's clipping polygons from whichever airports are
+// currently nearby. If none are nearby, the whole tileset is hidden
+// outright (cheaper than clipping to zero polygons, and avoids GP3DT
+// rendering with no clip region at all).
+function _hybridRebuildClipping() {
+    if (!hybridTileset) return;
+    const nearby = _hybridNearbyAirports();
+    if (!nearby.length) {
+        hybridTileset.show = false;
+        return;
+    }
+    hybridTileset.show = true;
+    const polygons = nearby.map(ap => new Cesium.ClippingPolygon({
+        positions: _hybridCirclePositions(ap.lat, ap.lng, HYBRID_AIRPORT_RADIUS_M)
+    }));
+    hybridTileset.clippingPolygons = new Cesium.ClippingPolygonCollection({
+        polygons,
+        unionClippingRegions: true, // OR the circles together into one region
+        inverse: true               // keep the INSIDE of the circles, clip (hide) everything outside
+    });
+    console.log(`[Hybrid] GP3DT clipped to ${nearby.length} nearby airport(s).`);
+}
+
+/**
+ * tryLoadHybridAirportGP3DT — loads GP3DT (same Ion asset as the full
+ * Photorealistic style) but keeps it permanently clipped to circles around
+ * nearby airports via _hybridRebuildClipping, and re-clips whenever the
+ * camera has moved far enough that the set of "nearby" airports may have
+ * changed. World Terrain + the ArcGIS/OSM globe stays visible underneath
+ * and is what's actually shown away from airports.
+ */
+function tryLoadHybridAirportGP3DT() {
+    if (!cesiumViewer || !CONFIG.CESIUM_ION) return;
+    if (settings.mapStyle !== 'hybrid') return;
+
+    setPhotorealStatus('Loading GP3DT for nearby airports…', 'info');
+    Cesium.Ion.defaultAccessToken = CONFIG.CESIUM_ION;
+
+    try {
+        const tilesetPromise = typeof Cesium.createGooglePhotorealistic3DTileset === 'function'
+            ? Cesium.createGooglePhotorealistic3DTileset()
+            : Cesium.Cesium3DTileset.fromIonAssetId(2275207);
+
+        Promise.resolve(tilesetPromise)
+            .then(tileset => {
+                if (!cesiumViewer || settings.mapStyle !== 'hybrid') return;
+                if (hybridTileset) cesiumViewer.scene.primitives.remove(hybridTileset);
+                cesiumViewer.scene.primitives.add(tileset);
+                hybridTileset = tileset;
+                hybridTileset.cullWithChildrenBounds = settings.occlusionCulling;
+
+                const startClipping = () => {
+                    _hybridRebuildClipping();
+                    _hybridLastCameraPos = Cesium.Cartesian3.clone(cesiumViewer.camera.positionWC);
+                };
+                if (AirportDB.isLoaded()) startClipping();
+                else AirportDB.load(startClipping);
+
+                // Re-clip whenever the camera travels far enough that a
+                // different set of airports might now be nearby — this is
+                // what makes GP3DT "follow" the player from airport to
+                // airport instead of only ever appearing at the first one.
+                if (_hybridMoveEndHandler) { _hybridMoveEndHandler(); _hybridMoveEndHandler = null; }
+                _hybridMoveEndHandler = cesiumViewer.camera.moveEnd.addEventListener(() => {
+                    if (settings.mapStyle !== 'hybrid' || !hybridTileset) return;
+                    const camPos = cesiumViewer.camera.positionWC;
+                    if (_hybridLastCameraPos && Cesium.Cartesian3.distance(camPos, _hybridLastCameraPos) < HYBRID_REFRESH_DIST_M) return;
+                    _hybridLastCameraPos = Cesium.Cartesian3.clone(camPos);
+                    _hybridRebuildClipping();
+                });
+
+                setPhotorealStatus('✓ World Terrain active — GP3DT loads at nearby airports.', 'success');
+                console.log('%c🌍✈️ Hybrid mode loaded: World Terrain + airport-only GP3DT', 'color:#22c55e;font-weight:bold');
+            })
+            .catch(e => {
+                console.warn('Hybrid airport GP3DT failed to load, staying on World Terrain only:', e);
+                setPhotorealStatus(diagnosePhotorealError(e), 'error');
+            });
+    } catch (e) {
+        console.warn('Hybrid airport GP3DT init failed:', e);
+        setPhotorealStatus(diagnosePhotorealError(e), 'error');
+    }
+}
+
+// Tears down the hybrid tileset + its camera listener — called whenever a
+// different 3D style is selected so nothing stale is left in the scene.
+function _teardownHybridAirportGP3DT() {
+    if (_hybridMoveEndHandler) { _hybridMoveEndHandler(); _hybridMoveEndHandler = null; }
+    _hybridLastCameraPos = null;
+    if (hybridTileset && cesiumViewer) {
+        cesiumViewer.scene.primitives.remove(hybridTileset);
+    }
+    hybridTileset = null;
+}
+
 /**
  * set3DStyle — switches the "3D Map Style" toggle in Settings between:
  *   'cesium'    → Cesium WorldTerrain elevation + OSM Buildings footprints
+ *   'hybrid'    → Cesium WorldTerrain everywhere + GP3DT clipped to circles
+ *                 around nearby airports only (see tryLoadHybridAirportGP3DT)
  *   'photoreal' → Google Photorealistic 3D Tiles (Ion asset 2275207, loaded
  *                 via Cesium.createGooglePhotorealistic3DTileset() in
  *                 tryLoadPhotorealisticTiles() — that helper resolves to
@@ -4577,13 +4760,29 @@ function set3DStyle(style) {
 
     const btnCesium    = document.getElementById('btn-style-cesium');
     const btnPhotoreal = document.getElementById('btn-style-photoreal');
+    const btnHybrid    = document.getElementById('btn-style-hybrid');
     if (btnCesium)    btnCesium.classList.toggle('active', style === 'cesium');
     if (btnPhotoreal) btnPhotoreal.classList.toggle('active', style === 'photoreal');
+    if (btnHybrid)    btnHybrid.classList.toggle('active', style === 'hybrid');
 
-    // GP3DT quality tab only applies to the Photorealistic style.
+    // GP3DT quality tab only applies to the Photorealistic / Hybrid styles.
     updateSettingsTabStates();
 
     if (!cesiumViewer) return; // nothing loaded yet to tear down/swap
+
+    // Always tear down whatever the OTHER styles had already loaded first,
+    // so switching styles never leaves a stale tileset in the scene.
+    if (style !== 'photoreal' && photorealTileset) {
+        cesiumViewer.scene.primitives.remove(photorealTileset);
+        photorealTileset = null;
+        if (_gp3dtGridTrimHandler) { _gp3dtGridTrimHandler(); _gp3dtGridTrimHandler = null; }
+        if (_gp3dtGridTrimPostRenderHandler) { _gp3dtGridTrimPostRenderHandler(); _gp3dtGridTrimPostRenderHandler = null; }
+        if (_gp3dtDistanceHandler) { _gp3dtDistanceHandler(); _gp3dtDistanceHandler = null; }
+        _gp3dtDistanceIsFar = null;
+    }
+    if (style !== 'hybrid') {
+        _teardownHybridAirportGP3DT();
+    }
 
     if (style === 'photoreal') {
         if (osmBuildingsTileset) {
@@ -4593,15 +4792,15 @@ function set3DStyle(style) {
         // Stop fetching terrain — irrelevant once the globe is hidden below.
         cesiumViewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
         tryLoadPhotorealisticTiles();
+    } else if (style === 'hybrid') {
+        // World Terrain everywhere (globe stays visible) + GP3DT clipped to
+        // circles around nearby airports only — see the block above.
+        cesiumViewer.scene.globe.show = true;
+        setPhotorealStatus('', null);
+        tryEnableWorldTerrain();
+        tryLoadOsmBuildings();
+        tryLoadHybridAirportGP3DT();
     } else {
-        if (photorealTileset) {
-            cesiumViewer.scene.primitives.remove(photorealTileset);
-            photorealTileset = null;
-        }
-        if (_gp3dtGridTrimHandler) { _gp3dtGridTrimHandler(); _gp3dtGridTrimHandler = null; }
-        if (_gp3dtGridTrimPostRenderHandler) { _gp3dtGridTrimPostRenderHandler(); _gp3dtGridTrimPostRenderHandler = null; }
-        if (_gp3dtDistanceHandler) { _gp3dtDistanceHandler(); _gp3dtDistanceHandler = null; }
-        _gp3dtDistanceIsFar = null;
         cesiumViewer.scene.globe.show = true;
         setPhotorealStatus('', null);
         tryEnableWorldTerrain();
@@ -4876,6 +5075,13 @@ function buildVehicleModels() {
                 }
                 cesiumViewer.scene.primitives.add(model);
                 model.show = false;
+                // Vehicle-only shadows: this model both casts and receives
+                // shadows (the tail darkening the fuselage, the sun-lit vs.
+                // shaded side seen in the reference screenshots). Terrain
+                // and every 3D-tile layer are explicitly set to
+                // ShadowMode.DISABLED elsewhere, so nothing else in the
+                // scene is affected by this.
+                model.shadows = Cesium.ShadowMode.ENABLED;
                 model._offset = new Cesium.Cartesian3(off[0], off[1], off[2]);
                 model._isGlb = true;
                 model._extraYawRad = Cesium.Math.toRadians(def.extraYawDeg || 0);
@@ -4901,7 +5107,8 @@ function buildVehicleModels() {
             const primitive = cesiumViewer.scene.primitives.add(new Cesium.Primitive({
                 geometryInstances: instance,
                 appearance: new Cesium.PerInstanceColorAppearance({ flat: true, closed: true }),
-                asynchronous: false   // compile on first render, not deferred
+                asynchronous: false,   // compile on first render, not deferred
+                shadows: Cesium.ShadowMode.ENABLED  // vehicle-only shadows (see initCesium)
             }));
             primitive.show = false;
             // Stash offset so updateVehicleModels can build the modelMatrix
@@ -5059,7 +5266,7 @@ function toggleFlashlight() {
  */
 function tryEnableWorldTerrain() {
     if (!cesiumViewer || !CONFIG.CESIUM_ION) return;
-    if (settings.mapStyle !== 'cesium') return; // skip while the Photorealistic style is active — globe is hidden, terrain would be wasted bandwidth
+    if (settings.mapStyle !== 'cesium' && settings.mapStyle !== 'hybrid') return; // skip while the Photorealistic style is active — globe is hidden, terrain would be wasted bandwidth
     try {
         Cesium.Ion.defaultAccessToken = CONFIG.CESIUM_ION;
         const terrainPromise = typeof Cesium.createWorldTerrainAsync === 'function'
@@ -5182,7 +5389,7 @@ function tryLoadOsmBuildings() {
         console.warn('OSM Buildings require a Cesium Ion token — paste one in Settings.');
         return;
     }
-    if (settings.mapStyle !== 'cesium') return; // Photorealistic style is active — see set3DStyle()
+    if (settings.mapStyle !== 'cesium' && settings.mapStyle !== 'hybrid') return; // Photorealistic style is active — see set3DStyle()
     // Remove any previously loaded instance first
     if (osmBuildingsTileset) {
         cesiumViewer.scene.primitives.remove(osmBuildingsTileset);
@@ -5216,6 +5423,9 @@ function tryLoadOsmBuildings() {
             if (!cesiumViewer) return;
             cesiumViewer.scene.primitives.add(tileset);
             osmBuildingsTileset = tileset;
+            // Vehicle-only shadows: OSM Buildings boxes must neither cast
+            // nor receive shadows from the vehicle model.
+            osmBuildingsTileset.shadows = Cesium.ShadowMode.DISABLED;
             await applyOsmBuildingsSatelliteTexture(tileset);
             console.log('%c🏙️ OSM Buildings loaded', 'color:#22c55e;font-weight:bold');
         })
