@@ -4601,10 +4601,12 @@ function tryLoadPhotorealisticTiles() {
 const HYBRID_AIRPORT_RADIUS_M = 3000;  // meters — GP3DT circle radius per airport; big enough to cover the whole airfield (runways+taxiways+terminal) plus a little buffer
 const HYBRID_REFRESH_DIST_M   = 5000;  // camera must travel this far before we recompute nearby airports / rebuild the clip circles
 const HYBRID_NEARBY_RANGE_M   = 60000; // only clip in airports within this range of the camera — keeps the polygon count (and clipping cost) small
+const HYBRID_MAX_AIRPORTS     = 12;    // hard cap on simultaneous clip circles — see _hybridNearbyAirports
 
 let hybridTileset             = null;
 let _hybridMoveEndHandler     = null;
 let _hybridLastCameraPos      = null;
+let _hybridClippingBroken     = false; // set true if ClippingPolygonCollection ever fails — stops retrying (see _hybridRebuildClipping)
 
 // Builds a circle (as a polygon) of `sides` points around lat/lng at the
 // given radius in meters — used as one ClippingPolygon per nearby airport.
@@ -4626,17 +4628,34 @@ function _hybridNearbyAirports() {
     if (!cesiumViewer || typeof AirportDB === 'undefined' || !AirportDB.isLoaded()) return [];
     const camPos  = cesiumViewer.camera.positionWC;
     const carto   = Cesium.Cartographic.fromCartesian(camPos);
+    if (!carto) return [];
     const lat     = Cesium.Math.toDegrees(carto.latitude);
     const lng     = Cesium.Math.toDegrees(carto.longitude);
+    // Guard against a not-yet-settled camera (e.g. hybrid toggled a frame
+    // before the vehicle/spawn position is applied) producing NaN lat/lng,
+    // which would otherwise propagate into NaN bounds → NaN circle
+    // positions → an invalid clipping-texture size inside Cesium later on.
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return [];
     const dLatDeg = HYBRID_NEARBY_RANGE_M / 111320;
-    const dLngDeg = HYBRID_NEARBY_RANGE_M / (111320 * Math.cos(lat * Math.PI / 180));
+    const cosLat  = Math.cos(lat * Math.PI / 180);
+    if (Math.abs(cosLat) < 1e-6) return []; // pole edge case — avoid divide-by-near-zero
+    const dLngDeg = HYBRID_NEARBY_RANGE_M / (111320 * cosLat);
     const types   = new Set(['large_airport', 'medium_airport', 'small_airport', 'military', 'heliport', 'seaplane_base']);
     // Coarse bounding-box prefilter, then an exact 3D distance check (the
     // box is rectangular in lat/lng so it over-includes at the corners).
     const candidates = AirportDB.getByBounds(lat - dLatDeg, lng - dLngDeg, lat + dLatDeg, lng + dLngDeg, types);
-    return candidates.filter(ap =>
-        Cesium.Cartesian3.distance(camPos, Cesium.Cartesian3.fromDegrees(ap.lng, ap.lat)) <= HYBRID_NEARBY_RANGE_M * 1.5
-    );
+    const nearby = candidates
+        .map(ap => ({ ap, dist: Cesium.Cartesian3.distance(camPos, Cesium.Cartesian3.fromDegrees(ap.lng, ap.lat)) }))
+        .filter(x => x.dist <= HYBRID_NEARBY_RANGE_M * 1.5)
+        .sort((a, b) => a.dist - b.dist);
+    // Cap the airport count: each one becomes a 32-point clipping polygon,
+    // and ClippingPolygonCollection packs every point into a single
+    // internal texture. A dense metro area (many small/heli airports) can
+    // otherwise push the point count high enough that the computed
+    // texture dimension is invalid, which is what was crashing the
+    // renderer with "Invalid array length". 12 airports is already far
+    // more than can be visually relevant at once.
+    return nearby.slice(0, HYBRID_MAX_AIRPORTS).map(x => x.ap);
 }
 
 // Rebuilds the tileset's clipping polygons from whichever airports are
@@ -4644,22 +4663,36 @@ function _hybridNearbyAirports() {
 // outright (cheaper than clipping to zero polygons, and avoids GP3DT
 // rendering with no clip region at all).
 function _hybridRebuildClipping() {
-    if (!hybridTileset) return;
+    if (!hybridTileset || _hybridClippingBroken) return;
     const nearby = _hybridNearbyAirports();
     if (!nearby.length) {
         hybridTileset.show = false;
         return;
     }
-    hybridTileset.show = true;
-    const polygons = nearby.map(ap => new Cesium.ClippingPolygon({
-        positions: _hybridCirclePositions(ap.lat, ap.lng, HYBRID_AIRPORT_RADIUS_M)
-    }));
-    hybridTileset.clippingPolygons = new Cesium.ClippingPolygonCollection({
-        polygons,
-        unionClippingRegions: true, // OR the circles together into one region
-        inverse: true               // keep the INSIDE of the circles, clip (hide) everything outside
-    });
-    console.log(`[Hybrid] GP3DT clipped to ${nearby.length} nearby airport(s).`);
+    try {
+        const polygons = nearby.map(ap => new Cesium.ClippingPolygon({
+            positions: _hybridCirclePositions(ap.lat, ap.lng, HYBRID_AIRPORT_RADIUS_M)
+        }));
+        hybridTileset.clippingPolygons = new Cesium.ClippingPolygonCollection({
+            polygons,
+            unionClippingRegions: true, // OR the circles together into one region
+            inverse: true               // keep the INSIDE of the circles, clip (hide) everything outside
+        });
+        hybridTileset.show = true;
+        console.log(`[Hybrid] GP3DT clipped to ${nearby.length} nearby airport(s).`);
+    } catch (e) {
+        // A ClippingPolygonCollection build failure (e.g. an internal
+        // texture-size limit, or missing floating-point-texture support on
+        // this GPU/browser) used to throw all the way up as
+        // "RangeError: Invalid array length" and stop the whole Cesium
+        // renderer. Fail safe instead: drop the airport-only clipping and
+        // just show GP3DT everywhere in view (or hide it — see below) so
+        // World Terrain keeps working regardless.
+        console.warn('[Hybrid] GP3DT clipping failed, disabling airport-only clip for this session:', e);
+        hybridTileset.clippingPolygons = undefined;
+        hybridTileset.show = false;
+        _hybridClippingBroken = true; // stop retrying every moveEnd — see tryLoadHybridAirportGP3DT
+    }
 }
 
 /**
@@ -4689,6 +4722,7 @@ function tryLoadHybridAirportGP3DT() {
                 cesiumViewer.scene.primitives.add(tileset);
                 hybridTileset = tileset;
                 hybridTileset.cullWithChildrenBounds = settings.occlusionCulling;
+                _hybridClippingBroken = false; // fresh tileset — give clipping another chance
 
                 const startClipping = () => {
                     _hybridRebuildClipping();
@@ -4728,6 +4762,7 @@ function tryLoadHybridAirportGP3DT() {
 function _teardownHybridAirportGP3DT() {
     if (_hybridMoveEndHandler) { _hybridMoveEndHandler(); _hybridMoveEndHandler = null; }
     _hybridLastCameraPos = null;
+    _hybridClippingBroken = false;
     if (hybridTileset && cesiumViewer) {
         cesiumViewer.scene.primitives.remove(hybridTileset);
     }
