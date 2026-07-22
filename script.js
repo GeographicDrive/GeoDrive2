@@ -4219,23 +4219,21 @@ function initCesium() {
         cesiumViewer.scene.sun.show = true;
         cesiumViewer.scene.moon.show = false;
 
-        // ── Vehicle-only shadows ────────────────────────────────────────
-        // The shadow map system is enabled scene-wide (required by Cesium
-        // for *any* primitive to cast/receive a shadow), but terrain
-        // explicitly opts out via its own `.shadows` property, and every
-        // 3D-tile layer (GP3DT, OSM Buildings) is set the same way as soon
-        // as it loads — see tryLoadPhotorealisticTiles() / tryLoadOsmBuildings().
-        // Net effect: only the vehicle GLB model (set to
-        // Cesium.ShadowMode.ENABLED in buildVehicleModels) casts and
-        // receives shadows — self-shadowing on the fuselage/tail like the
-        // reference screenshots — while terrain, OSM Buildings and Google
-        // Photorealistic 3D Tiles stay completely unaffected: no shadow
-        // cast onto the ground/buildings, none received from them either.
-        cesiumViewer.shadows = true;
-        cesiumViewer.shadowMap.softShadows     = true;  // soft-edged, not a hard pixelated cutoff
-        cesiumViewer.shadowMap.size            = 2048;  // sharp self-shadow on the model
-        cesiumViewer.shadowMap.darkness        = 0.35;  // shaded side stays ambient-lit, never pure black
-        cesiumViewer.shadowMap.maximumDistance = 2000;   // only needs to cover the immediate vehicle area
+        // ── Shadows: OFF at the Cesium shadow-map level ─────────────────
+        // Real-time shadow mapping (cesiumViewer.shadows = true) generates
+        // an extra fragment-shader variant for every model that has a
+        // CustomShader attached (the plane/car glass+PBR fix below). That
+        // variant fails to compile ("Fragment shader failed to compile.
+        // Compile log: null") because the shadow-pass shader merge can't
+        // reconcile the custom `discard` / material.alpha edits in
+        // _glbOpaqueShaderPlane / _glbOpaqueShaderCar. The soft self-shadow
+        // look from the reference screenshots (dark tail-shadow on the
+        // fuselage, ambient-lit shaded side instead of pure black) is
+        // already produced directly inside those CustomShaders via the
+        // ambientFill + Fresnel rim terms — it doesn't need Cesium's real
+        // shadow map at all, so leaving this off avoids the crash with no
+        // visible loss.
+        cesiumViewer.shadows = false;
         cesiumViewer.scene.globe.shadows        = Cesium.ShadowMode.DISABLED;
         cesiumViewer.scene.globe.receiveShadows = false;
 
@@ -4371,10 +4369,10 @@ function applyGP3DTQualitySettings() {
     cesiumViewer.scene.fog.density = gp3dtSettings.fogDensity;
     cesiumViewer.scene.fog.enabled = gp3dtSettings.fogDensity > 0;
 
-    // Scene-wide shadows: kept ON (vehicle-only shadows — see initCesium).
-    // Terrain must stay excluded regardless of which quality preset is
-    // active, so it's re-asserted here too.
-    cesiumViewer.shadows = true;
+    // Scene-wide shadows kept OFF — see initCesium for why (CustomShader
+    // shader-compile crash on the vehicle models). Terrain stays excluded
+    // regardless, in case this is ever safely re-enabled later.
+    cesiumViewer.shadows = false;
     cesiumViewer.terrainShadows = Cesium.ShadowMode.DISABLED;
     cesiumViewer.scene.globe.shadows = Cesium.ShadowMode.DISABLED;
 
@@ -5075,13 +5073,12 @@ function buildVehicleModels() {
                 }
                 cesiumViewer.scene.primitives.add(model);
                 model.show = false;
-                // Vehicle-only shadows: this model both casts and receives
-                // shadows (the tail darkening the fuselage, the sun-lit vs.
-                // shaded side seen in the reference screenshots). Terrain
-                // and every 3D-tile layer are explicitly set to
-                // ShadowMode.DISABLED elsewhere, so nothing else in the
-                // scene is affected by this.
-                model.shadows = Cesium.ShadowMode.ENABLED;
+                // Shadows deliberately left at their default (Cesium's
+                // scene-wide shadow map is off — see initCesium — because
+                // it broke shader compilation for this model's
+                // CustomShader). The self-shadow look is already handled
+                // inside _glbOpaqueShaderPlane / _glbOpaqueShaderCar via
+                // the ambientFill + rim terms.
                 model._offset = new Cesium.Cartesian3(off[0], off[1], off[2]);
                 model._isGlb = true;
                 model._extraYawRad = Cesium.Math.toRadians(def.extraYawDeg || 0);
@@ -5107,8 +5104,7 @@ function buildVehicleModels() {
             const primitive = cesiumViewer.scene.primitives.add(new Cesium.Primitive({
                 geometryInstances: instance,
                 appearance: new Cesium.PerInstanceColorAppearance({ flat: true, closed: true }),
-                asynchronous: false,   // compile on first render, not deferred
-                shadows: Cesium.ShadowMode.ENABLED  // vehicle-only shadows (see initCesium)
+                asynchronous: false   // compile on first render, not deferred
             }));
             primitive.show = false;
             // Stash offset so updateVehicleModels can build the modelMatrix
