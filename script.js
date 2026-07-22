@@ -173,17 +173,22 @@ const textures = {
 // ==========================================
 // 1b. API KEYS / CONFIG
 // ==========================================
-// No keys are hardcoded here. Cesium Ion / the optional Google key only get
-// used if the person pastes them into the textboxes in Settings — that
-// save flow is the single source of truth, and it also remembers the value
-// in this browser (localStorage) so it doesn't need to be re-typed every
-// visit. Nothing here is committed to the repo or shipped by default.
+// No keys are hardcoded here. There are two sources for the Cesium Ion
+// token, in priority order:
+//   1. A token the person pasted into Settings — stored in this browser's
+//      localStorage. Always wins if present.
+//   2. A default project token exposed as window.__DEFAULT_CESIUM_TOKEN__,
+//      which comes from config.js. That file is generated at deploy time
+//      from the CESIUM_TOKEN GitHub secret (see .github/workflows/deploy.yml)
+//      and is never committed to the repo — the copy of config.js checked
+//      into git only ever has an empty default for local development.
 const CONFIG_KEYS = {
     CESIUM_ION:      'biv_cesium_ion_token',
     CESIUM_CAM_MODE: 'biv_cesium_cam_mode'
 };
+const DEFAULT_CESIUM_ION_TOKEN = (typeof window !== 'undefined' && window.__DEFAULT_CESIUM_TOKEN__) || '';
 const CONFIG = {
-    CESIUM_ION:      localStorage.getItem(CONFIG_KEYS.CESIUM_ION)      || '',
+    CESIUM_ION:      localStorage.getItem(CONFIG_KEYS.CESIUM_ION)      || DEFAULT_CESIUM_ION_TOKEN,
     CESIUM_CAM_MODE: localStorage.getItem(CONFIG_KEYS.CESIUM_CAM_MODE) || 'first'
 };
 
@@ -4130,8 +4135,10 @@ let satelliteTextureCenter = null; // {lat, lng} where the current tile grid was
 /**
  * initCesium — sets up the Cesium viewer with ArcGIS satellite imagery as a
  * base. No keys are required to run: Cesium Ion / Photorealistic 3D Tiles
- * are only layered in if the person has saved an Ion token via Settings
- * (see CONFIG / applyCesiumIonToken).
+ * are layered in using CONFIG.CESIUM_ION, which is either the project's
+ * default token (from config.js / the CESIUM_TOKEN GitHub secret) or a
+ * token the person has saved via Settings, whichever takes priority (see
+ * the CONFIG block near the top of this file / applyCesiumIonToken).
  */
 function initCesium() {
     if (typeof Cesium === 'undefined') {
@@ -5072,20 +5079,26 @@ function tryEnableWorldTerrain() {
 }
 
 /**
- * applyCesiumIonToken — the ONLY place an Ion token ever enters this app.
- * Reads the Settings textbox, saves it to localStorage (so it's remembered
- * on this device next visit) and immediately enables WorldTerrain, OSM
- * Buildings (if toggled on), and free Photorealistic 3D Tiles — all three
- * ride on this same token.
+ * applyCesiumIonToken — reads the Settings textbox, saves it to
+ * localStorage (so it's remembered on this device next visit) and
+ * immediately enables WorldTerrain, OSM Buildings (if toggled on), and free
+ * Photorealistic 3D Tiles — all three ride on this same token. A token
+ * saved here always overrides the app's default project token
+ * (DEFAULT_CESIUM_ION_TOKEN); use "Clear saved keys" to go back to it.
  */
-function applyCesiumIonToken() {
-    const input = document.getElementById('cesium-token-input');
+function applyCesiumIonToken(inputId) {
+    const input = document.getElementById(inputId || 'cesium-token-input');
     const token = input.value.trim();
     if (!token) return;
     localStorage.setItem(CONFIG_KEYS.CESIUM_ION, token);
     CONFIG.CESIUM_ION = token;
-    input.value = '';
-    input.placeholder = '✓ Token saved on this device';
+    ['cesium-token-input', 'cesium-token-input-2d'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.value = '';
+            el.placeholder = '✓ Token saved on this device';
+        }
+    });
     tryEnableWorldTerrain();
     tryLoadPhotorealisticTiles();
     tryLoadOsmBuildings();
@@ -5392,13 +5405,18 @@ async function applyOsmBuildingsSatelliteTexture(tileset) {
 
 
 /**
- * clearSavedKeys — removes the saved Ion token from this device and reverts
+ * clearSavedKeys — removes the token the person entered on this device and
+ * reverts to the default project token (window.__DEFAULT_CESIUM_TOKEN__ /
+ * the CESIUM_TOKEN GitHub secret) if one is available, otherwise falls back
  * to the no-key default (ArcGIS imagery, flat terrain, no photoreal tiles).
  */
 function clearSavedKeys() {
     localStorage.removeItem(CONFIG_KEYS.CESIUM_ION);
-    CONFIG.CESIUM_ION = '';
-    document.getElementById('cesium-token-input').placeholder = 'eyJhbGci...';
+    CONFIG.CESIUM_ION = DEFAULT_CESIUM_ION_TOKEN;
+    ['cesium-token-input', 'cesium-token-input-2d'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.placeholder = 'eyJhbGci...';
+    });
     setPhotorealStatus('', null);
     if (photorealTileset && cesiumViewer) {
         cesiumViewer.scene.primitives.remove(photorealTileset);
@@ -5411,8 +5429,15 @@ function clearSavedKeys() {
         osmBuildingsTileset = null;
     }
     if (cesiumViewer) {
-        Cesium.Ion.defaultAccessToken = 'none';
+        Cesium.Ion.defaultAccessToken = CONFIG.CESIUM_ION || 'none';
         cesiumViewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+    }
+    if (CONFIG.CESIUM_ION) {
+        // A default project token is available — re-enable WorldTerrain now
+        // that Ion.defaultAccessToken points at it again. Photorealistic
+        // Tiles / OSM Buildings stay off until the person re-enables them,
+        // since "Clear" is meant to reset those choices too.
+        tryEnableWorldTerrain();
     }
     // Photorealistic Tiles need a token, so always land back on the
     // Terrain + OSM style (which works fine without one) after a clear.

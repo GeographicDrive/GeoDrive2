@@ -232,14 +232,14 @@
                         <button id="btn-style-cesium" class="btn-ui" onclick="set3DStyle('cesium')" style="flex:1;">🗺️ World Terrain + OSM</button>
                         <button id="btn-style-photoreal" class="btn-ui active" onclick="set3DStyle('photoreal')" style="flex:1;">🌆 Google Photorealistic</button>
                     </div>
-                    <label style="margin-top: 12px;">Cesium Ion Token</label>
+                    <label style="margin-top: 12px;">Cesium Ion Token <span style="font-weight:400;">(optional — this app already includes one)</span></label>
                     <div style="display:flex; gap:8px; margin-top:6px;">
                         <input type="text" id="cesium-token-input" placeholder="eyJhbGci..." style="flex:1; font-size:0.75rem; padding:6px;">
                         <button onclick="applyCesiumIonToken()" style="flex-shrink:0;">Apply</button>
                     </div>
-                    <p class="desc-text" style="margin-top:4px;">Get a free token at <a href="https://ion.cesium.com" target="_blank" style="color:#f59e0b;">ion.cesium.com</a>.</p>
+                    <p class="desc-text" style="margin-top:4px;">Paste your own token here to use it instead (e.g. for higher usage limits). Get a free one at <a href="https://ion.cesium.com" target="_blank" style="color:#f59e0b;">ion.cesium.com</a>.</p>
                     <p class="desc-text" id="photoreal-status" style="margin-top:8px; display:none; font-weight:600;"></p>
-                    <button onclick="clearSavedKeys()" class="danger" style="margin-top:12px; width:100%;">Clear saved keys on this device</button>
+                    <button onclick="clearSavedKeys()" class="danger" style="margin-top:12px; width:100%;">Clear my token (revert to the app's default)</button>
                 </div>
                 </div>
 
@@ -378,7 +378,7 @@
                         <option value="arcgis" selected>ArcGIS World Imagery</option>
                         <option value="osm">OpenStreetMap</option>
                     </select>
-                    <label style="margin-top: 12px;">Cesium Ion Token</label>
+                    <label style="margin-top: 12px;">Cesium Ion Token <span style="font-weight:400;">(optional — this app already includes one)</span></label>
                     <div style="display:flex; gap:8px; margin-top:6px;">
                         <input type="text" id="cesium-token-input-2d" placeholder="eyJhbGci..." style="flex:1; font-size:0.75rem; padding:6px;">
                         <button onclick="applyCesiumIonToken('cesium-token-input-2d')" style="flex-shrink:0;">Apply</button>
@@ -1010,6 +1010,10 @@
 <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/Cesium.js"></script>
 
+<!-- Provides window.__DEFAULT_CESIUM_TOKEN__. The committed copy is blank;
+     the deployed copy is generated from the CESIUM_TOKEN GitHub secret by
+     .github/workflows/deploy.yml and is never committed to the repo. -->
+<script src="config.js"></script>
 
 <script src="script.js"></script>
 <script src="pfd.js"></script>
