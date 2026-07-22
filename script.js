@@ -2129,7 +2129,9 @@ document.getElementById('vehicle-select').addEventListener('change', e => {
         flight.verticalSpeed = 0; flight.throttle = 0;
         flight.gearDown = true; flight.brakeActive = false; flight.reverseActive = false; flight.flapsDown = false;
         flight.groundRef = null;
+        flight.rudderDeflection = 0;
         flightInput.pitch = 0; flightInput.roll = 0; flightInput.yaw = 0;
+        tillerInput = 0;
         ensureFlightSim(true); // reseed the 6-DOF sim at the new position/attitude
 
         const slider = document.getElementById('flight-throttle-slider');
@@ -3340,12 +3342,22 @@ function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
 
     if (originHeight === null) return; // nothing cached under us yet — request is queued, try again once it lands
 
+    // Airborne + moving forward: noclip through anything that isn't the
+    // ground itself (buildings, towers, foliage, etc.) — only an actual
+    // on-ground/taxiing plane should ever be stopped dead by an obstacle.
+    // "On the ground" here mirrors the onGround gate used for A320 callouts
+    // (agl <= 2 ft — see updateA320Audio) rather than flight.gearDown, since
+    // gear can be down while still flying.
+    const airborneNoclip = isPlaneType(state.vehicle) && (flight.alt || 0) > 2 && state.speed > 0;
+
     const tolerance = vehicleObstacleClearanceM(state.vehicle);
     let hitCount = 0;
-    for (const pt of ringPts) {
-        const h = _getCachedHeight(pt.lat, pt.lng, mPerDegLat, mPerDegLng);
-        if (h === null) continue; // not cached yet — request already queued above; don't guess, don't block on it
-        if (h - originHeight > tolerance) hitCount++;
+    if (!airborneNoclip) {
+        for (const pt of ringPts) {
+            const h = _getCachedHeight(pt.lat, pt.lng, mPerDegLat, mPerDegLng);
+            if (h === null) continue; // not cached yet — request already queued above; don't guess, don't block on it
+            if (h - originHeight > tolerance) hitCount++;
+        }
     }
     // Require at least 2 independent sample points to agree before treating
     // it as a real obstacle. A single point spiking is almost always a
@@ -3369,10 +3381,16 @@ const flight = {
     throttle: 0, alt: 125,
     verticalSpeed: 0,
     gearDown: true, brakeActive: false, reverseActive: false, flapsDown: false,
-    groundRef: null   // real terrain elevation (m) flight.alt is measured from; re-locked near the ground, frozen while airborne — see updateCesiumCamera
+    groundRef: null,  // real terrain elevation (m) flight.alt is measured from; re-locked near the ground, frozen while airborne — see updateCesiumCamera
+    rudderDeflection: 0  // deg, actuator-modeled rudder surface position — see RUDDER (RTLU) block in updateFlight()
 };
 const flightInput = { pitch: 0, roll: 0, yaw: 0 };
 let flightJoystickActive = false;
+// Tiller (nosewheel steering) input, -1 (full left) .. +1 (full right).
+// Completely separate from flightInput.yaw/the rudder — the tiller only
+// ever drives ground steering (see the ground-steering block in the main
+// update() loop), it has no effect on the rudder surface or in the air.
+let tillerInput = 0;
 
 /**
  * autopilot — simple 3-axis autopilot (heading hold / altitude hold / speed
@@ -3599,11 +3617,85 @@ if (yawSlider) {
 }
 
 /**
+ * setupFlightRudder — real rudder-pedal-style control. Looks like a
+ * slider (a track with a ball-shaped knob on it) but is drag-driven, not
+ * a plain <input type=range>, and it has a real centering spring: on
+ * release it eases back to 0 instead of just jumping there. Drives
+ * flightInput.yaw (-1 full left .. +1 full right), which feeds the
+ * pedal term of the rudder command in updateFlight() below.
+ */
+function setupFlightRudder(containerId, trackId, knobId) {
+    const container = document.getElementById(containerId);
+    const track = document.getElementById(trackId);
+    const knob = document.getElementById(knobId);
+    if (!container || !track || !knob) return;
+
+    let activePointerId = null;
+    let springFrame = null;
+
+    function setKnob(frac) {
+        const maxX = track.clientWidth / 2 - knob.clientWidth / 2;
+        knob.style.transform = `translateX(${frac * maxX}px)`;
+        flightInput.yaw = frac;
+        if (yawSlider) yawSlider.value = frac.toFixed(2);
+    }
+
+    function fracFromPoint(clientX) {
+        const rect = track.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const maxX = rect.width / 2 - knob.clientWidth / 2;
+        return Math.max(-1, Math.min(1, (clientX - cx) / maxX));
+    }
+
+    function stopSpring() {
+        if (springFrame !== null) { cancelAnimationFrame(springFrame); springFrame = null; }
+    }
+
+    // Centering "spring": eases the knob (and flightInput.yaw) back to 0
+    // with a decaying velocity instead of snapping straight there, so it
+    // actually feels like a sprung pedal instead of a slider default.
+    function springToCenter() {
+        stopSpring();
+        function step() {
+            const current = flightInput.yaw;
+            if (Math.abs(current) < 0.01) { setKnob(0); springFrame = null; return; }
+            setKnob(current * 0.72); // exponential decay back to centre
+            springFrame = requestAnimationFrame(step);
+        }
+        springFrame = requestAnimationFrame(step);
+    }
+
+    container.addEventListener('pointerdown', (e) => {
+        if (activePointerId !== null) return;
+        stopSpring();
+        activePointerId = e.pointerId;
+        container.setPointerCapture(e.pointerId);
+        setKnob(fracFromPoint(e.clientX));
+    });
+
+    container.addEventListener('pointermove', (e) => {
+        if (e.pointerId !== activePointerId) return;
+        setKnob(fracFromPoint(e.clientX));
+    });
+
+    function release(e) {
+        if (e.pointerId !== activePointerId) return;
+        activePointerId = null;
+        springToCenter();
+    }
+    container.addEventListener('pointerup',     release);
+    container.addEventListener('pointercancel', release);
+}
+setupFlightRudder('flight-rudder-container', 'flight-rudder-track', 'flight-rudder-knob');
+
+/**
  * setupFlightTiller — real-aircraft-style tiller knob (see tiller.png).
  * Drag it left/right (or up/down — either works, whichever feels like
- * "turning a small wheel") and it rotates around its pivot and drives
- * flightInput.yaw exactly like the old rudder slider (-1 full left ..
- * +1 full right), auto-centering back to 0 on release.
+ * "turning a small wheel") and it rotates around its pivot. Unlike the
+ * rudder, this does NOT touch flightInput.yaw at all — it only ever
+ * drives `tillerInput`, which the ground-steering block in the main
+ * update() loop uses to turn the plane on the ground with the exact same
+ * steering formula as the car/bus (see there). Auto-centers on release.
  */
 function setupFlightTiller(containerId, imgId) {
     const container = document.getElementById(containerId);
@@ -3625,9 +3717,7 @@ function setupFlightTiller(containerId, imgId) {
 
     function applyAngle(deg) {
         img.style.transform = `rotate(${deg}deg)`;
-        flightInput.yaw = deg / MAX_ANGLE;
-        // Keep the hidden fallback slider in sync (gamepad/keyboard readers, debug HUD, etc.)
-        if (yawSlider) yawSlider.value = flightInput.yaw.toFixed(2);
+        tillerInput = deg / MAX_ANGLE;
     }
 
     container.addEventListener('pointerdown', (e) => {
@@ -3645,7 +3735,7 @@ function setupFlightTiller(containerId, imgId) {
     function releaseTiller(e) {
         if (e.pointerId !== activePointerId) return;
         activePointerId = null;
-        applyAngle(0); // auto-centers, same behavior as the old rudder slider
+        applyAngle(0); // auto-centers
     }
     container.addEventListener('pointerup',     releaseTiller);
     container.addEventListener('pointercancel', releaseTiller);
@@ -3926,12 +4016,50 @@ function updateFlight(dt) {
     const yawDamperGain = 0.12;
     const yawDamperInput = -(sim.state[5] || 0) * yawDamperGain;
 
+    // ── RUDDER (Airbus A320 rudder command law + RTLU) ──────────────────
+    // delta_r_cmd = delta_pedal + delta_trim + delta_dutch_roll + delta_turn_coord
+    // delta_pedal:      pilot rudder-pedal input (the rudder control), full
+    //                    deflection commands +/-30°, before the RTLU clamps it.
+    // delta_trim:       rudder trim — not modeled as a separate control yet,
+    //                    always 0 for now.
+    // delta_dutch_roll: the always-on yaw damper above, converted to degrees.
+    // delta_turn_coord: turn-coordination assist — not modeled yet, 0 for now.
+    const delta_pedal      = yawInput * 30;      // deg
+    const delta_trim       = 0;                  // deg
+    const delta_dutch_roll = yawDamperInput * 30; // deg
+    const delta_turn_coord = 0;                  // deg
+    const delta_r_cmd = delta_pedal + delta_trim + delta_dutch_roll + delta_turn_coord;
+
+    // Rudder Travel Limiter Unit (RTLU) — full +/-25° authority below
+    // 160 kt, tapering linearly down to +/-3.4° by 380 kt, to keep the fin
+    // from being overstressed at high speed.
+    const V_IAS = Math.abs(state.speed || 0) / 1.852; // knots
+    let delta_r_max;
+    if (V_IAS < 160) {
+        delta_r_max = 25.0;
+    } else if (V_IAS <= 380) {
+        delta_r_max = 25.0 - ((V_IAS - 160) / (380 - 160)) * (25.0 - 3.4);
+    } else {
+        delta_r_max = 3.4;
+    }
+
+    // Saturation + actuator slew-rate dynamics: the rudder surface can't
+    // snap instantly to the commanded position, it slews toward it at a
+    // bounded rate (deg/s), rate-limited to +/-60°/s, over a fast actuator
+    // time constant.
+    const tau_actuator = 0.15; // s
+    const delta_r_limited = Math.max(-delta_r_max, Math.min(delta_r_max, delta_r_cmd));
+    const delta_r_current = flight.rudderDeflection || 0;
+    const ddelta_r_dt = Math.max(-60, Math.min(60, (delta_r_limited - delta_r_current) / tau_actuator));
+    const delta_r_final = delta_r_current + ddelta_r_dt * dt;
+    flight.rudderDeflection = delta_r_final;
+
     // Map arcade inputs onto control-surface deflections (radians).
     // Elevator sign convention: nose-up command -> negative Cmde deflection.
     const controls = {
         delta_e: -pitchInput * 0.45 * settings.flightSensitivity,
         delta_a:  rollInput  * 0.45 * settings.flightSensitivity,
-        delta_r:  (yawInput + yawDamperInput) * 0.35,
+        delta_r:  delta_r_final * Math.PI / 180, // deg -> rad
         throttle: (flight.throttle / 100) * settings.flightAcceleration,
         gearDown: flight.gearDown,
         brakeActive: flight.brakeActive,
@@ -6009,6 +6137,24 @@ function update() {
     if (isPlaneType(state.vehicle)) {
         updateFlight(dt);
         updateA320Audio(dt);
+
+        // ── Tiller ground steering ──────────────────────────────────────
+        // Only active on the ground (0-5 ft AGL) — this is the plane's ONLY
+        // source of ground steering (the rudder has no say in heading while
+        // taxiing here). Uses the exact same steering formula the car/bus
+        // branch below uses: turnInput * baseTurnRate * steeringSensitivity
+        // * dt * sign(speed), just fed by the tiller instead of arrow
+        // keys/joystick.
+        if ((flight.alt || 0) <= 5 && Math.abs(state.speed) > 0.5) {
+            const baseTurnRate = 60; // deg/s at full tiller deflection
+            state.heading += baseTurnRate * tillerInput * settings.steeringSensitivity * dt * Math.sign(state.speed);
+            state.heading = (state.heading + 360) % 360;
+        }
+
+        // Tiller only makes sense (and only appears) while on the ground —
+        // hide it in the air.
+        const tillerEl = document.getElementById('flight-tiller-container');
+        if (tillerEl) tillerEl.style.display = ((flight.alt || 0) <= 5) ? 'flex' : 'none';
     } else {
         const accel = 15, brake = 25, fric = 4,
               maxSpeed = state.vehicle === 'car' ? 130 : 80;
