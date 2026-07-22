@@ -4601,7 +4601,7 @@ function tryLoadPhotorealisticTiles() {
 const HYBRID_AIRPORT_RADIUS_M = 3000;  // meters — GP3DT circle radius per airport; big enough to cover the whole airfield (runways+taxiways+terminal) plus a little buffer
 const HYBRID_REFRESH_DIST_M   = 5000;  // camera must travel this far before we recompute nearby airports / rebuild the clip circles
 const HYBRID_NEARBY_RANGE_M   = 60000; // only clip in airports within this range of the camera — keeps the polygon count (and clipping cost) small
-const HYBRID_MAX_AIRPORTS     = 12;    // hard cap on simultaneous clip circles — see _hybridNearbyAirports
+const HYBRID_MAX_AIRPORTS     = 6;     // hard cap on simultaneous clip circles — see _hybridNearbyAirports
 
 let hybridTileset             = null;
 let _hybridMoveEndHandler     = null;
@@ -4610,7 +4610,7 @@ let _hybridClippingBroken     = false; // set true if ClippingPolygonCollection 
 
 // Builds a circle (as a polygon) of `sides` points around lat/lng at the
 // given radius in meters — used as one ClippingPolygon per nearby airport.
-function _hybridCirclePositions(lat, lng, radiusM, sides = 32) {
+function _hybridCirclePositions(lat, lng, radiusM, sides = 16) {
     const positions = [];
     const latRad = lat * Math.PI / 180;
     for (let i = 0; i < sides; i++) {
@@ -4828,10 +4828,26 @@ function set3DStyle(style) {
     } else if (style === 'hybrid') {
         // World Terrain everywhere (globe stays visible) + GP3DT clipped to
         // circles around nearby airports only — see the block above.
+        //
+        // OSM Buildings is deliberately NOT loaded here (unlike the plain
+        // 'cesium' style below). Running World Terrain + OSM Buildings +
+        // GP3DT-with-clipping-polygons all at once turned out to overload
+        // Cesium's globe tile bookkeeping and clipping-plane budget badly
+        // enough to crash the whole renderer ("Invalid array length" inside
+        // the globe's own quadtree traversal, not our clipping code). GP3DT
+        // already draws real textured buildings at every clipped airport,
+        // so OSM's plain grey boxes would only add redundant, z-fighting
+        // geometry there anyway — same reasoning the 'photoreal' style uses.
+        if (osmBuildingsTileset) {
+            cesiumViewer.scene.primitives.remove(osmBuildingsTileset);
+            osmBuildingsTileset = null;
+            settings.osmBuildings = false;
+            const cb = document.getElementById('set-osm-buildings');
+            if (cb) cb.checked = false;
+        }
         cesiumViewer.scene.globe.show = true;
         setPhotorealStatus('', null);
         tryEnableWorldTerrain();
-        tryLoadOsmBuildings();
         tryLoadHybridAirportGP3DT();
     } else {
         cesiumViewer.scene.globe.show = true;
@@ -5420,7 +5436,11 @@ function tryLoadOsmBuildings() {
         console.warn('OSM Buildings require a Cesium Ion token — paste one in Settings.');
         return;
     }
-    if (settings.mapStyle !== 'cesium' && settings.mapStyle !== 'hybrid') return; // Photorealistic style is active — see set3DStyle()
+    // Excludes 'hybrid' now too: running OSM Buildings alongside World
+    // Terrain + GP3DT-with-clipping in hybrid mode is what overloaded
+    // Cesium's globe tile bookkeeping and crashed the renderer — see the
+    // comment in set3DStyle()'s 'hybrid' branch.
+    if (settings.mapStyle !== 'cesium') return;
     // Remove any previously loaded instance first
     if (osmBuildingsTileset) {
         cesiumViewer.scene.primitives.remove(osmBuildingsTileset);
