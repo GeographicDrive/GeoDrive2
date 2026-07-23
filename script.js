@@ -3168,16 +3168,15 @@ function ensureFlightSim(reseed) {
 // actually rendering under the plane (World Terrain heightmap resolution,
 // or the photorealistic 3D Tiles mesh, neither of which samples the same
 // source data the database was compiled from). Since the collision/AGL
-// math needs to match the *visual* ground, not the paper record, the
-// database value is now only an instant placeholder used for the first
-// frame or two after spawn — see _sampleRealGroundElevation /
-// _correctAirportElevation below, called from confirmSpawnLocation, which
-// replace it with a real height sampled straight from whatever surface
-// Cesium is actually drawing at that point. That's what fixes the old
-// symptom of needing planeHeightOffset maxed out at some airports and
-// still not enough at others: the offset was being used to paper over a
-// per-airport database/terrain mismatch instead of its intended job (a
-// small constant visual nudge for model/gear origin).
+// math needs to match the *visual* ground, not the paper record,
+// confirmSpawnLocation awaits _resolveAirportElevation (see below) before
+// placing anything, and uses that real sampled height instead of the
+// database value. That's what fixes the old symptom of needing
+// planeHeightOffset maxed out at some airports and still not enough at
+// others — and of spawning inside/under the terrain while a post-hoc
+// correction caught up — the offset and the pop-in were both papering
+// over a per-airport database/terrain mismatch that's now resolved
+// before the plane ever appears.
 
 const _AIRPORT_COLLISION_RADIUS_M = 5000; // 5 km flat collision disc around the airport centre
 
@@ -3197,82 +3196,83 @@ const _airportElevSampleCache = {};
 let _spawnGen = 0;
 
 /**
- * _sampleRealGroundElevation — reads the actual height Cesium already has
- * loaded (terrain heightmap) at a given lat/lng, so the flat collision
- * disc can be anchored to reality instead of trusting a database field
- * that may not match the mesh.
+ * _sampleRealGroundElevation — reads the actual terrain height Cesium has
+ * for a given lat/lng, so the flat collision disc (and the initial spawn
+ * placement itself) can be anchored to reality instead of trusting a
+ * database field that may not match the mesh.
  *
- * Deliberately NOT using Scene#sampleHeightMostDetailed here: that call
- * doesn't just read a number, it force-requests tiles up to max detail
- * and pumps extra scene renders while they arrive, which is what was
- * causing the stutter — it's built for one-off precision queries, not a
- * "just tell me roughly what's already there" read. globe.getHeight is
- * the cheap counterpart: it looks at whatever terrain tile is already
- * resident and returns instantly (undefined if nothing's loaded there
- * yet), no forced fetching, no extra renders, no lag.
- *
- * Returns null immediately if there's no real terrain to read (flat
- * EllipsoidTerrainProvider, no viewer, or the tile for this spot hasn't
- * loaded yet) — callers just keep the database value in that case.
+ * Two-tier: first try globe.getHeight(), which just checks whatever tile
+ * is already resident and returns instantly — free, no lag, but only
+ * works if that tile happens to already be loaded (true for airports near
+ * where you've already been flying/looking). For a brand-new airport
+ * nothing there has streamed in yet, so this falls through to
+ * Scene#sampleHeightMostDetailed, which force-requests whatever tiles are
+ * needed at that exact point and resolves once they're in — a real cost
+ * (waits for tiles to load), but a bounded, one-time one, and it's the
+ * only way to get a guaranteed answer for ground never rendered before.
+ * That cost is paid at most ONCE per airport (see the cache in
+ * _resolveAirportElevation below).
  */
-function _sampleRealGroundElevation(lat, lng) {
+async function _sampleRealGroundElevation(lat, lng) {
     if (!cesiumViewer || !cesiumViewer.scene.globe) return null;
+    const carto = Cesium.Cartographic.fromDegrees(lng, lat);
+
     try {
-        const carto = Cesium.Cartographic.fromDegrees(lng, lat);
-        const h = cesiumViewer.scene.globe.getHeight(carto);
-        return Number.isFinite(h) ? h : null;
+        const fast = cesiumViewer.scene.globe.getHeight(carto);
+        if (Number.isFinite(fast)) return fast;
+    } catch (e) { /* fall through to the guaranteed path below */ }
+
+    try {
+        if (typeof cesiumViewer.scene.sampleHeightMostDetailed === 'function') {
+            const cart = Cesium.Cartesian3.fromDegrees(lng, lat, 0);
+            const results = await cesiumViewer.scene.sampleHeightMostDetailed([cart]);
+            const h = results && results[0] && Cesium.Cartographic.fromCartesian(results[0]).height;
+            return Number.isFinite(h) ? h : null;
+        }
+        if (cesiumViewer.terrainProvider && typeof Cesium.sampleTerrainMostDetailed === 'function') {
+            const [sampled] = await Cesium.sampleTerrainMostDetailed(cesiumViewer.terrainProvider, [carto]);
+            return Number.isFinite(sampled.height) ? sampled.height : null;
+        }
     } catch (e) {
-        return null;
+        console.warn('[Elevation] Real ground sample failed, keeping database elevation:', e);
     }
+    return null;
 }
 
 /**
- * _correctAirportElevation — takes one cheap real-ground reading for the
- * airport that just became the active spawn and, if it got a number,
- * swaps the disc's elevM (and flight.groundRef) over to it. Cached per
- * ICAO so a given airport is only ever read once per session — every
- * later spawn there is an instant cache hit, no re-sampling, no lag.
+ * _resolveAirportElevation — the actual fix for "always spawn below/inside
+ * the terrain". The old approach placed the aircraft immediately using the
+ * database elevation, then patched _activeAirportCenter.elevM up to the
+ * real value once a sample resolved — meaning there was always a window,
+ * every single spawn, where the plane sat wherever the (often-wrong)
+ * database said the ground was while the real terrain streamed in around
+ * it, popping into its correct position a moment later. Embedded-in-ground
+ * is exactly what that produces.
  *
- * If the terrain tile isn't loaded yet on the first try, this makes
- * exactly ONE retry ~1.5s later (giving the tile a moment to stream in)
- * and then gives up for good, caching whatever it got (even null) — no
- * polling loop, so there's no ongoing cost after that single retry.
- * No-op for spawns with no known ICAO (free map click).
+ * This is called instead with `await` from confirmSpawnLocation, BEFORE
+ * anything (groundRef, camera, the aircraft's actual position) is placed —
+ * so there's nothing to patch after the fact, because placement simply
+ * doesn't happen until the real number is known.
+ *
+ * Cached per ICAO, so this cost — a real one-time wait while tiles load —
+ * is only ever paid the *first* time you spawn at a given airport in a
+ * session; every later spawn there is an instant cache hit and skips the
+ * wait entirely. Guarded with a timeout (default 4s) so a slow connection
+ * or unreachable tile server can never hang the spawn screen forever — on
+ * timeout this falls back to the database value for THIS spawn, but the
+ * sample keeps running in the background and still populates the cache,
+ * so the next spawn there won't need to wait at all.
  */
-function _correctAirportElevation(icao, lat, lng, _isRetry) {
-    if (!icao || icao === '—') return;
-    const gen = _spawnGen;
-
-    if (!_isRetry && Object.prototype.hasOwnProperty.call(_airportElevSampleCache, icao)) {
-        const cached = _airportElevSampleCache[icao];
-        if (cached != null) _applyRealElevation(icao, lat, lng, gen, cached);
-        return;
+function _resolveAirportElevation(icao, lat, lng, timeoutMs = 4000) {
+    if (Object.prototype.hasOwnProperty.call(_airportElevSampleCache, icao)) {
+        return Promise.resolve(_airportElevSampleCache[icao]);
     }
-
-    const realElevM = _sampleRealGroundElevation(lat, lng);
-    if (realElevM != null) {
-        _airportElevSampleCache[icao] = realElevM;
-        _applyRealElevation(icao, lat, lng, gen, realElevM);
-    } else if (!_isRetry) {
-        // Tile likely hasn't streamed in yet — one single delayed retry,
-        // not a loop.
-        setTimeout(() => _correctAirportElevation(icao, lat, lng, true), 1500);
-    } else {
-        _airportElevSampleCache[icao] = null; // give up for this session, stop retrying
-    }
-}
-
-function _applyRealElevation(icao, lat, lng, gen, realElevM) {
-    if (gen !== _spawnGen) return; // stale — player already respawned elsewhere
-    if (!_activeAirportCenter || _activeAirportCenter.lat !== lat || _activeAirportCenter.lng !== lng) return;
-    const delta = realElevM - _activeAirportCenter.elevM;
-    if (Math.abs(delta) < 0.5) return; // already close enough, skip the log noise
-    _activeAirportCenter.elevM = realElevM;
-    // Keep the aircraft's current AGL reading meaningful: if it's still
-    // sitting on the ground reference from spawn, shift groundRef by the
-    // same delta rather than leaving it pointing at the old value.
-    if (flight.groundRef != null) flight.groundRef += delta;
-    console.log(`[Elevation] ${icao}: corrected disc elevation by ${delta.toFixed(1)}m (real terrain read) → ${realElevM.toFixed(1)}m`);
+    const samplePromise = _sampleRealGroundElevation(lat, lng).then(h => {
+        _airportElevSampleCache[icao] = h;
+        return h;
+    });
+    const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(undefined), timeoutMs));
+    return Promise.race([samplePromise, timeoutPromise]).then(result => (result === undefined ? null : result));
 }
 
 // Current AGL ground reference (meters) — see the AGL tracking block in
@@ -7606,14 +7606,15 @@ function _escHTML(s) {
 // ── confirmSpawnLocation ──────────────────────────────────────────────────────
 // The only entry point that actually starts the game. Teleports the vehicle
 // to the selected location and initialises all subsystems for the first time.
-function confirmSpawnLocation() {
+async function confirmSpawnLocation() {
     if (!_spawnSelected) return;
     _spawnGen++; // invalidate any elevation sample still in flight from a previous spawn
+    const gen = _spawnGen;
 
     const ap   = _spawnSelected;
     let lat    = ap.lat;
     let lng    = ap.lng;
-    let elev   = ap.elev; // feet (may be null)
+    let elev   = ap.elev; // feet (may be null) — starting/fallback value, corrected below
     let spawnHeading = 0;
 
     // ── Runway / operation resolution ─────────────────────────────────────
@@ -7632,17 +7633,8 @@ function confirmSpawnLocation() {
     // Reset the flat 5 km ground-collision disc for this spawn — re-anchored
     // below to the airport's own centre/elevation when one is known, left
     // null otherwise (free map click) so ground collision is simply off.
-    _activeAirportCenter = (ap.icao && ap.icao !== '—')
-        ? { lat: ap.lat, lng: ap.lng, elevM: (ap.elev != null ? ap.elev * 0.3048 : 0) }
-        : null;
-    // Kick off an async real-terrain sample to correct that database
-    // elevation once Cesium can tell us what's actually rendered there —
-    // see _correctAirportElevation for why this is needed. Anchored to
-    // the airport's own centre coordinates (ap.lat/lng), matching what
-    // _activeAirportCenter itself is anchored to, regardless of where on
-    // the field this particular spawn (runway threshold, approach point)
-    // ends up.
-    if (_activeAirportCenter) _correctAirportElevation(ap.icao, ap.lat, ap.lng);
+    const dbCentreElevM = ap.elev != null ? ap.elev * 0.3048 : 0;
+    _activeAirportCenter = (ap.icao && ap.icao !== '—') ? { lat: ap.lat, lng: ap.lng, elevM: dbCentreElevM } : null;
 
     if (isPlaneType(state.vehicle) && rwyVal) {
         try {
@@ -7690,6 +7682,34 @@ function confirmSpawnLocation() {
         if (runways.length) {
             const longest = runways.slice().sort((a, b) => b.lengthFt - a.lengthFt)[0];
             _activeRunway = Object.assign({}, longest, { icao: ap.icao });
+        }
+    }
+
+    // ── Resolve the REAL ground elevation before placing anything at all ───
+    // This is what stops the plane ever spawning below/inside the terrain:
+    // lat/lng/elev above are now final (runway threshold or airport centre,
+    // whichever applies), so this samples the real terrain at that exact
+    // spot and corrects `elev` by the same delta the disc's centre moved —
+    // preserving any legitimate threshold-vs-centre elevation difference
+    // instead of just overwriting it. Briefly disables the confirm button
+    // so a second click can't race this. Usually resolves in well under a
+    // second (instant on repeat visits to an airport thanks to the cache);
+    // only pays a longer one-time cost the very first time a given
+    // airport's terrain has never been sampled in this session.
+    if (_activeAirportCenter) {
+        const confirmBtn = document.getElementById('spawn-confirm-btn');
+        const confirmBtnOriginalText = confirmBtn ? confirmBtn.innerHTML : null;
+        if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.innerHTML = '⏳ Loading ground…'; }
+
+        const realCentreElevM = await _resolveAirportElevation(ap.icao, ap.lat, ap.lng);
+
+        if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.innerHTML = confirmBtnOriginalText; }
+        if (gen !== _spawnGen) return; // player cancelled/respawned elsewhere while we were waiting
+
+        if (realCentreElevM != null) {
+            const delta = realCentreElevM - dbCentreElevM;
+            if (elev != null) elev += delta / 0.3048; // shift threshold elev by the same real-vs-database delta
+            _activeAirportCenter.elevM = realCentreElevM;
         }
     }
 
