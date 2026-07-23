@@ -1129,6 +1129,52 @@ button.danger { background: var(--danger); }
     50%       { opacity: 0.9; }
 }
 
+/* ── Ground/Terrain Loading Overlay ──────────────────────────────────────
+   Shown for a guaranteed minimum stretch between confirming a spawn and
+   actually being dropped into the world, so the real ground elevation and
+   the visible terrain tiles are both ready before anything is revealed —
+   no popping in, no starting below the mesh. */
+#ground-loading-screen {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(ellipse at center, #0f172a 0%, #020617 100%);
+}
+#ground-loading-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    text-align: center;
+}
+#ground-loading-spinner {
+    width: 46px;
+    height: 46px;
+    border-radius: 50%;
+    border: 3px solid rgba(148,163,184,0.2);
+    border-top-color: #60a5fa;
+    animation: ground-loading-spin 0.9s linear infinite;
+}
+@keyframes ground-loading-spin {
+    to { transform: rotate(360deg); }
+}
+#ground-loading-title {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    letter-spacing: 0.02em;
+}
+#ground-loading-sub {
+    margin: 0;
+    font-size: 0.82rem;
+    color: #64748b;
+    transition: opacity 0.15s ease;
+}
+
 /* ── Spawn Selector Screen ────────────────────────────────────────────── */
 #spawn-selector-screen {
     position: fixed;

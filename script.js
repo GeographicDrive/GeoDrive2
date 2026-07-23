@@ -7611,6 +7611,18 @@ async function confirmSpawnLocation() {
     _spawnGen++; // invalidate any elevation sample still in flight from a previous spawn
     const gen = _spawnGen;
 
+    // Show the loading overlay FIRST, before touching any placement logic —
+    // nothing (menu, camera, aircraft) should be visible/interactive again
+    // until spawn is fully ready. See the end of this function for the
+    // matching minimum-5-second hold + hide.
+    const loadStart = performance.now();
+    const loadScreen = document.getElementById('ground-loading-screen');
+    const loadSub     = document.getElementById('ground-loading-sub');
+    const selectorEl  = document.getElementById('spawn-selector-screen');
+    if (loadScreen) loadScreen.style.display = 'flex';
+    if (selectorEl) selectorEl.style.display = 'none';
+    const setLoadingText = (t) => { if (loadSub) loadSub.textContent = t; };
+
     const ap   = _spawnSelected;
     let lat    = ap.lat;
     let lng    = ap.lng;
@@ -7689,21 +7701,17 @@ async function confirmSpawnLocation() {
     // This is what stops the plane ever spawning below/inside the terrain:
     // lat/lng/elev above are now final (runway threshold or airport centre,
     // whichever applies), so this samples the real terrain at that exact
-    // spot and corrects `elev` by the same delta the disc's centre moved —
+    // spot ONCE — this is the only height sample for the entire spawn, and
+    // nothing else in the spawn/game-loop code samples height again after
+    // this — and corrects `elev` by the same delta the disc's centre moved,
     // preserving any legitimate threshold-vs-centre elevation difference
-    // instead of just overwriting it. Briefly disables the confirm button
-    // so a second click can't race this. Usually resolves in well under a
-    // second (instant on repeat visits to an airport thanks to the cache);
-    // only pays a longer one-time cost the very first time a given
+    // instead of just overwriting it. Usually resolves in well under a
+    // second (instant on repeat visits to an airport, thanks to the
+    // cache); only pays a longer one-time cost the very first time a given
     // airport's terrain has never been sampled in this session.
     if (_activeAirportCenter) {
-        const confirmBtn = document.getElementById('spawn-confirm-btn');
-        const confirmBtnOriginalText = confirmBtn ? confirmBtn.innerHTML : null;
-        if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.innerHTML = '⏳ Loading ground…'; }
-
+        setLoadingText('Sampling real ground elevation…');
         const realCentreElevM = await _resolveAirportElevation(ap.icao, ap.lat, ap.lng);
-
-        if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.innerHTML = confirmBtnOriginalText; }
         if (gen !== _spawnGen) return; // player cancelled/respawned elsewhere while we were waiting
 
         if (realCentreElevM != null) {
@@ -7712,6 +7720,9 @@ async function confirmSpawnLocation() {
             _activeAirportCenter.elevM = realCentreElevM;
         }
     }
+    // Disc is now placed at its final, real-terrain-anchored height and
+    // will not be touched again for this spawn.
+    setLoadingText('Placing collision disc…');
 
     // ── 1. Apply selected spawn position to game state ─────────────────────
     state.lat     = lat;
@@ -7756,6 +7767,9 @@ async function confirmSpawnLocation() {
     }
 
     // ── 3. Sync Cesium camera to spawn location immediately ────────────────
+    // (This is what makes the terrain/tile loading we wait for below
+    // actually be loading the right tiles — camera has to be looking at
+    // the spawn point for the tile loader to prioritize it.)
     if (cesiumViewer) {
         try {
             let camAlt, camPitch;
@@ -7782,28 +7796,59 @@ async function confirmSpawnLocation() {
         }
     }
 
-    // ── 4. Hide spawn UI with a smooth fade ───────────────────────────────
-    const selector = document.getElementById('spawn-selector-screen');
-    selector.style.animation = 'spawn-fade-out 0.4s ease both';
-    setTimeout(() => {
-        selector.style.display = 'none';
-
-        // ── 5. Start the game (no preload/streaming wait) ───────────────────
-        gameStarted = true;
-        console.log(`[Spawn] Game started at ${lat.toFixed(5)}, ${lng.toFixed(5)}`);
-        if (isNightMode) setTimeout(_spawnNightLights, 600);
-
-        // ── 6. If a landing site was chosen alongside the takeoff site,
-        // set it as the GPS destination. Remember the departure ICAO and
-        // heading too, so the procedural route generator can build a
-        // smooth, rounded-turn course that leaves this spawn point on its
-        // actual departure heading.
-        state.originIcao = (ap.icao && ap.icao !== '—') ? ap.icao : null;
-        state.originHdg = spawnHeading;
-        if (isPlaneType(state.vehicle) && _spawnLandingSelected) {
-            setGPSDestinationFromLanding(_spawnLandingSelected);
+    // ── 4. Wait for the actual visible terrain/tiles to finish loading ─────
+    // Polls Cesium's own "still fetching tiles" flags (globe heightmap +
+    // photorealistic 3D Tiles, whichever applies) rather than guessing at
+    // a fixed delay — this is "the tile" and "the EVERYTHING" finishing,
+    // not just the one elevation number from step above. Capped at 8s so a
+    // slow connection can't hang the loading screen forever; falls through
+    // and spawns with whatever's loaded so far if that cap is hit.
+    setLoadingText('Loading terrain tiles…');
+    if (cesiumViewer) {
+        const tileWaitStart = performance.now();
+        while (performance.now() - tileWaitStart < 8000) {
+            const globeDone   = !cesiumViewer.scene.globe || cesiumViewer.scene.globe.tilesLoaded;
+            const tilesetDone = typeof photorealTileset === 'undefined' || !photorealTileset || photorealTileset.tilesLoaded;
+            if (globeDone && tilesetDone) break;
+            await new Promise(r => setTimeout(r, 150));
         }
-    }, 380);
+        if (gen !== _spawnGen) return; // player cancelled/respawned elsewhere while we were waiting
+    }
+
+    // ── 5. Enforce a minimum 5-second loading screen ────────────────────────
+    // Elevation sampling + tile loading above are often fast (cached
+    // airport, nearby tiles already resident) — but revealing the moment
+    // they finish would make the loading screen flash inconsistently
+    // (sometimes instant, sometimes several seconds). Holding a fixed
+    // floor makes it predictable regardless of how fast the actual work
+    // was, and gives slow loads a bit more headroom to finish quietly
+    // behind the screen instead of popping in mid-reveal.
+    setLoadingText('Almost ready…');
+    const elapsed = performance.now() - loadStart;
+    const MIN_LOADING_MS = 5000;
+    if (elapsed < MIN_LOADING_MS) {
+        await new Promise(r => setTimeout(r, MIN_LOADING_MS - elapsed));
+        if (gen !== _spawnGen) return; // player cancelled/respawned elsewhere while we were waiting
+    }
+
+    // ── 6. Reveal: hide the loading overlay and the (already-hidden) spawn
+    // selector together, then start the game ───────────────────────────────
+    if (loadScreen) loadScreen.style.display = 'none';
+    if (selectorEl) selectorEl.style.display = 'none';
+
+    gameStarted = true;
+    console.log(`[Spawn] Game started at ${lat.toFixed(5)}, ${lng.toFixed(5)}`);
+    if (isNightMode) setTimeout(_spawnNightLights, 600);
+
+    // ── 7. If a landing site was chosen alongside the takeoff site, set it
+    // as the GPS destination. Remember the departure ICAO and heading too,
+    // so the procedural route generator can build a smooth, rounded-turn
+    // course that leaves this spawn point on its actual departure heading.
+    state.originIcao = (ap.icao && ap.icao !== '—') ? ap.icao : null;
+    state.originHdg = spawnHeading;
+    if (isPlaneType(state.vehicle) && _spawnLandingSelected) {
+        setGPSDestinationFromLanding(_spawnLandingSelected);
+    }
 }
 
 // ── Re-render markers on zoom change (density culling) ────────────────────────

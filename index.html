@@ -859,6 +859,17 @@
         </div>
     </div>
 
+    <!-- 1b. Ground/Terrain Loading Overlay — shown between confirm click and
+         actual spawn, so nothing (aircraft, camera, disc) is ever visible
+         sitting in the wrong place while the real terrain streams in. -->
+    <div id="ground-loading-screen" style="display:none;">
+        <div id="ground-loading-box">
+            <div id="ground-loading-spinner"></div>
+            <p id="ground-loading-title">Preparing spawn…</p>
+            <p id="ground-loading-sub">Sampling real ground elevation</p>
+        </div>
+    </div>
+
     <!-- 2. Spawn Selector Screen — fullscreen map + controls -->
     <div id="spawn-selector-screen" style="display:none;">
         <!-- Globe/Map -->
