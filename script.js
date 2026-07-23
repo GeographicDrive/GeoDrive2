@@ -3158,9 +3158,26 @@ function ensureFlightSim(reseed) {
 // HeightReference.CLAMP_TO_GROUND to always sit on whatever surface is
 // actually there; the ground collider is kept just as simple — a flat
 // disc, radius _AIRPORT_COLLISION_RADIUS_M, centered on the spawn
-// airport's published field elevation. Inside that disc "the ground" is
-// that one flat height; outside it there's no ground collision at all
-// (cruise flight, cross-country driving, etc. never needed it).
+// airport's elevation. Inside that disc "the ground" is that one flat
+// height; outside it there's no ground collision at all (cruise flight,
+// cross-country driving, etc. never needed it).
+//
+// Where that elevation number comes from: the OurAirports database
+// `elevation_ft` field is a *published/surveyed* figure that frequently
+// disagrees — sometimes by tens of meters — with whatever Cesium is
+// actually rendering under the plane (World Terrain heightmap resolution,
+// or the photorealistic 3D Tiles mesh, neither of which samples the same
+// source data the database was compiled from). Since the collision/AGL
+// math needs to match the *visual* ground, not the paper record, the
+// database value is now only an instant placeholder used for the first
+// frame or two after spawn — see _sampleRealGroundElevation /
+// _correctAirportElevation below, called from confirmSpawnLocation, which
+// replace it with a real height sampled straight from whatever surface
+// Cesium is actually drawing at that point. That's what fixes the old
+// symptom of needing planeHeightOffset maxed out at some airports and
+// still not enough at others: the offset was being used to paper over a
+// per-airport database/terrain mismatch instead of its intended job (a
+// small constant visual nudge for model/gear origin).
 
 const _AIRPORT_COLLISION_RADIUS_M = 5000; // 5 km flat collision disc around the airport centre
 
@@ -3168,6 +3185,85 @@ const _AIRPORT_COLLISION_RADIUS_M = 5000; // 5 km flat collision disc around the
 // frame's collision disc is anchored to. null if the current spawn has no
 // known airport (e.g. a free map click) — collision is simply off then.
 let _activeAirportCenter = null; // { lat, lng, elevM }
+
+// Cache of real sampled ground elevations (meters) keyed by ICAO, so
+// repeat spawns at the same airport in this session don't re-sample.
+const _airportElevSampleCache = {};
+
+// Bumped every confirmSpawnLocation() call. The async elevation sample
+// captures its value at request time; if it's stale by the time the
+// sample resolves (player already respawned elsewhere) the result is
+// discarded instead of clobbering the new spawn's ground reference.
+let _spawnGen = 0;
+
+/**
+ * _sampleRealGroundElevation — asynchronously samples the actual height
+ * Cesium is rendering (terrain heightmap and/or 3D Tiles, whichever is
+ * currently on top) at a given lat/lng, so the flat collision disc can be
+ * anchored to reality instead of trusting a database field that may not
+ * match the mesh. Uses Scene#sampleHeightMostDetailed, which works
+ * uniformly across World Terrain, OSM Buildings, and the photorealistic
+ * GP3DT tileset — whichever mapStyle is currently active — by ray-casting
+ * against whatever's actually loaded, requesting higher-detail tiles at
+ * that position as needed regardless of where the camera currently is.
+ * Falls back to terrain-only sampling (sampleTerrainMostDetailed) on
+ * older Cesium builds that lack sampleHeightMostDetailed, and resolves
+ * null if neither is available (flat EllipsoidTerrainProvider / no
+ * viewer) so callers keep the database value in that case.
+ */
+async function _sampleRealGroundElevation(lat, lng) {
+    if (!cesiumViewer) return null;
+    try {
+        if (typeof cesiumViewer.scene.sampleHeightMostDetailed === 'function') {
+            const cart = Cesium.Cartesian3.fromDegrees(lng, lat, 0);
+            const results = await cesiumViewer.scene.sampleHeightMostDetailed([cart]);
+            const h = results && results[0] && Cesium.Cartographic.fromCartesian(results[0]).height;
+            return Number.isFinite(h) ? h : null;
+        }
+        if (cesiumViewer.terrainProvider && typeof Cesium.sampleTerrainMostDetailed === 'function') {
+            const carto = Cesium.Cartographic.fromDegrees(lng, lat);
+            const [sampled] = await Cesium.sampleTerrainMostDetailed(cesiumViewer.terrainProvider, [carto]);
+            return Number.isFinite(sampled.height) ? sampled.height : null;
+        }
+    } catch (e) {
+        console.warn('[Elevation] Real ground sample failed, keeping database elevation:', e);
+    }
+    return null;
+}
+
+/**
+ * _correctAirportElevation — kicks off the real-ground sample for the
+ * airport that just became the active spawn, and once it resolves, swaps
+ * the disc's elevM (and, if we're still parked at this same spawn,
+ * flight.groundRef) over to the real value. Cached per ICAO so this only
+ * ever costs one async round-trip per airport per session. No-op for
+ * spawns with no known ICAO (free map click).
+ */
+function _correctAirportElevation(icao, lat, lng) {
+    if (!icao || icao === '—') return;
+    const gen = _spawnGen;
+
+    const apply = (realElevM) => {
+        if (realElevM == null || gen !== _spawnGen) return; // stale — player already respawned elsewhere
+        if (!_activeAirportCenter || _activeAirportCenter.lat !== lat || _activeAirportCenter.lng !== lng) return;
+        const delta = realElevM - _activeAirportCenter.elevM;
+        _activeAirportCenter.elevM = realElevM;
+        // Keep the aircraft's current AGL reading meaningful: if it's still
+        // sitting on the ground reference from spawn, shift groundRef by
+        // the same delta rather than leaving it pointing at the old value.
+        if (flight.groundRef != null) flight.groundRef += delta;
+        console.log(`[Elevation] ${icao}: corrected disc elevation ${(realElevM - delta).toFixed(1)}m → ${realElevM.toFixed(1)}m (real terrain sample)`);
+    };
+
+    if (Object.prototype.hasOwnProperty.call(_airportElevSampleCache, icao)) {
+        apply(_airportElevSampleCache[icao]);
+        return;
+    }
+    _sampleRealGroundElevation(lat, lng).then(realElevM => {
+        _airportElevSampleCache[icao] = realElevM;
+        apply(realElevM);
+    });
+}
 
 // Current AGL ground reference (meters) — see the AGL tracking block in
 // updateCesiumCamera; kept as a plain variable, not a smoothed cache read,
@@ -7502,6 +7598,7 @@ function _escHTML(s) {
 // to the selected location and initialises all subsystems for the first time.
 function confirmSpawnLocation() {
     if (!_spawnSelected) return;
+    _spawnGen++; // invalidate any elevation sample still in flight from a previous spawn
 
     const ap   = _spawnSelected;
     let lat    = ap.lat;
@@ -7528,6 +7625,14 @@ function confirmSpawnLocation() {
     _activeAirportCenter = (ap.icao && ap.icao !== '—')
         ? { lat: ap.lat, lng: ap.lng, elevM: (ap.elev != null ? ap.elev * 0.3048 : 0) }
         : null;
+    // Kick off an async real-terrain sample to correct that database
+    // elevation once Cesium can tell us what's actually rendered there —
+    // see _correctAirportElevation for why this is needed. Anchored to
+    // the airport's own centre coordinates (ap.lat/lng), matching what
+    // _activeAirportCenter itself is anchored to, regardless of where on
+    // the field this particular spawn (runway threshold, approach point)
+    // ends up.
+    if (_activeAirportCenter) _correctAirportElevation(ap.icao, ap.lat, ap.lng);
 
     if (isPlaneType(state.vehicle) && rwyVal) {
         try {
