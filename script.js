@@ -4059,6 +4059,17 @@ function updateFlight(dt) {
 // ==========================================
 let cesiumViewer      = null;
 let cesiumLabelsLayer = null;   // for hybrid mode in Cesium
+
+// Tracks the in-flight (or settled) WorldTerrain swap kicked off by
+// tryEnableWorldTerrain(), so other code — specifically the spawn flow —
+// can await "is the REAL terrain provider active yet?" instead of
+// sampling/rendering against the flat EllipsoidTerrainProvider placeholder
+// and finding out later that real (often much higher) terrain phases in
+// underneath. Resolves true once cesiumViewer.terrainProvider is the real
+// thing, false if it failed/was skipped (no token, wrong mapStyle, etc) —
+// either way, once settled it's safe to proceed with whatever terrain is
+// actually active.
+let _worldTerrainReadyPromise = null;
 let photorealTileset  = null;   // Google Photorealistic 3D Tiles (once loaded)
 let osmBuildingsTileset    = null; // Cesium OSM Buildings (once loaded)
 let satelliteTextureCenter = null; // {lat, lng} where the current tile grid was fetched
@@ -5243,23 +5254,26 @@ function toggleFlashlight() {
  * and Google Tiles loaders above.
  */
 function tryEnableWorldTerrain() {
-    if (!cesiumViewer || !CONFIG.CESIUM_ION) return;
-    if (settings.mapStyle !== 'cesium' && settings.mapStyle !== 'hybrid') return; // skip while the Photorealistic style is active — globe is hidden, terrain would be wasted bandwidth
+    if (!cesiumViewer || !CONFIG.CESIUM_ION) { _worldTerrainReadyPromise = Promise.resolve(false); return; }
+    if (settings.mapStyle !== 'cesium' && settings.mapStyle !== 'hybrid') { _worldTerrainReadyPromise = Promise.resolve(false); return; } // skip while the Photorealistic style is active — globe is hidden, terrain would be wasted bandwidth
     try {
         Cesium.Ion.defaultAccessToken = CONFIG.CESIUM_ION;
         const terrainPromise = typeof Cesium.createWorldTerrainAsync === 'function'
             ? Cesium.createWorldTerrainAsync({ requestWaterMask: true })
             : Cesium.createWorldTerrain({ requestWaterMask: true });
 
-        Promise.resolve(terrainPromise).then(tp => {
-            if (!cesiumViewer) return;
+        _worldTerrainReadyPromise = Promise.resolve(terrainPromise).then(tp => {
+            if (!cesiumViewer) return false;
             cesiumViewer.terrainProvider = tp;
             console.log('%c🌍 WorldTerrain enabled!', 'color:#22c55e;font-weight:bold');
+            return true;
         }).catch(e => {
             console.warn('WorldTerrain failed to load, staying on flat terrain:', e);
+            return false;
         });
     } catch (e) {
         console.warn('WorldTerrain init failed:', e);
+        _worldTerrainReadyPromise = Promise.resolve(false);
     }
 }
 
@@ -7695,6 +7709,24 @@ async function confirmSpawnLocation() {
             const longest = runways.slice().sort((a, b) => b.lengthFt - a.lengthFt)[0];
             _activeRunway = Object.assign({}, longest, { icao: ap.icao });
         }
+    }
+
+    // ── Wait for the REAL terrain provider (not the flat Ellipsoid
+    // placeholder) before sampling anything ────────────────────────────────
+    // tryEnableWorldTerrain() swaps cesiumViewer.terrainProvider from the
+    // flat placeholder to real WorldTerrain asynchronously at page load,
+    // completely independent of the spawn flow. Spawning before that swap
+    // finishes was the actual cause of ending up "inside the sphere" —
+    // every height sample and the camera placement below would happen
+    // against flat ground at ~0m, and then real (often much higher)
+    // terrain would phase in underneath a moment later, leaving the
+    // camera buried inside it. Capped at 6s so a missing/invalid Ion
+    // token can't hang the spawn screen forever — falls through to
+    // whatever terrain is currently active (flat, worst case) if hit.
+    if (_worldTerrainReadyPromise && (settings.mapStyle === 'cesium' || settings.mapStyle === 'hybrid')) {
+        setLoadingText('Loading real terrain…');
+        await Promise.race([_worldTerrainReadyPromise, new Promise(r => setTimeout(r, 6000))]);
+        if (gen !== _spawnGen) return; // player cancelled/respawned elsewhere while we were waiting
     }
 
     // ── Resolve the REAL ground elevation before placing anything at all ───
