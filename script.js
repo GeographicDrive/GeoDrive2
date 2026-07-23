@@ -3197,72 +3197,82 @@ const _airportElevSampleCache = {};
 let _spawnGen = 0;
 
 /**
- * _sampleRealGroundElevation — asynchronously samples the actual height
- * Cesium is rendering (terrain heightmap and/or 3D Tiles, whichever is
- * currently on top) at a given lat/lng, so the flat collision disc can be
- * anchored to reality instead of trusting a database field that may not
- * match the mesh. Uses Scene#sampleHeightMostDetailed, which works
- * uniformly across World Terrain, OSM Buildings, and the photorealistic
- * GP3DT tileset — whichever mapStyle is currently active — by ray-casting
- * against whatever's actually loaded, requesting higher-detail tiles at
- * that position as needed regardless of where the camera currently is.
- * Falls back to terrain-only sampling (sampleTerrainMostDetailed) on
- * older Cesium builds that lack sampleHeightMostDetailed, and resolves
- * null if neither is available (flat EllipsoidTerrainProvider / no
- * viewer) so callers keep the database value in that case.
+ * _sampleRealGroundElevation — reads the actual height Cesium already has
+ * loaded (terrain heightmap) at a given lat/lng, so the flat collision
+ * disc can be anchored to reality instead of trusting a database field
+ * that may not match the mesh.
+ *
+ * Deliberately NOT using Scene#sampleHeightMostDetailed here: that call
+ * doesn't just read a number, it force-requests tiles up to max detail
+ * and pumps extra scene renders while they arrive, which is what was
+ * causing the stutter — it's built for one-off precision queries, not a
+ * "just tell me roughly what's already there" read. globe.getHeight is
+ * the cheap counterpart: it looks at whatever terrain tile is already
+ * resident and returns instantly (undefined if nothing's loaded there
+ * yet), no forced fetching, no extra renders, no lag.
+ *
+ * Returns null immediately if there's no real terrain to read (flat
+ * EllipsoidTerrainProvider, no viewer, or the tile for this spot hasn't
+ * loaded yet) — callers just keep the database value in that case.
  */
-async function _sampleRealGroundElevation(lat, lng) {
-    if (!cesiumViewer) return null;
+function _sampleRealGroundElevation(lat, lng) {
+    if (!cesiumViewer || !cesiumViewer.scene.globe) return null;
     try {
-        if (typeof cesiumViewer.scene.sampleHeightMostDetailed === 'function') {
-            const cart = Cesium.Cartesian3.fromDegrees(lng, lat, 0);
-            const results = await cesiumViewer.scene.sampleHeightMostDetailed([cart]);
-            const h = results && results[0] && Cesium.Cartographic.fromCartesian(results[0]).height;
-            return Number.isFinite(h) ? h : null;
-        }
-        if (cesiumViewer.terrainProvider && typeof Cesium.sampleTerrainMostDetailed === 'function') {
-            const carto = Cesium.Cartographic.fromDegrees(lng, lat);
-            const [sampled] = await Cesium.sampleTerrainMostDetailed(cesiumViewer.terrainProvider, [carto]);
-            return Number.isFinite(sampled.height) ? sampled.height : null;
-        }
+        const carto = Cesium.Cartographic.fromDegrees(lng, lat);
+        const h = cesiumViewer.scene.globe.getHeight(carto);
+        return Number.isFinite(h) ? h : null;
     } catch (e) {
-        console.warn('[Elevation] Real ground sample failed, keeping database elevation:', e);
+        return null;
     }
-    return null;
 }
 
 /**
- * _correctAirportElevation — kicks off the real-ground sample for the
- * airport that just became the active spawn, and once it resolves, swaps
- * the disc's elevM (and, if we're still parked at this same spawn,
- * flight.groundRef) over to the real value. Cached per ICAO so this only
- * ever costs one async round-trip per airport per session. No-op for
- * spawns with no known ICAO (free map click).
+ * _correctAirportElevation — takes one cheap real-ground reading for the
+ * airport that just became the active spawn and, if it got a number,
+ * swaps the disc's elevM (and flight.groundRef) over to it. Cached per
+ * ICAO so a given airport is only ever read once per session — every
+ * later spawn there is an instant cache hit, no re-sampling, no lag.
+ *
+ * If the terrain tile isn't loaded yet on the first try, this makes
+ * exactly ONE retry ~1.5s later (giving the tile a moment to stream in)
+ * and then gives up for good, caching whatever it got (even null) — no
+ * polling loop, so there's no ongoing cost after that single retry.
+ * No-op for spawns with no known ICAO (free map click).
  */
-function _correctAirportElevation(icao, lat, lng) {
+function _correctAirportElevation(icao, lat, lng, _isRetry) {
     if (!icao || icao === '—') return;
     const gen = _spawnGen;
 
-    const apply = (realElevM) => {
-        if (realElevM == null || gen !== _spawnGen) return; // stale — player already respawned elsewhere
-        if (!_activeAirportCenter || _activeAirportCenter.lat !== lat || _activeAirportCenter.lng !== lng) return;
-        const delta = realElevM - _activeAirportCenter.elevM;
-        _activeAirportCenter.elevM = realElevM;
-        // Keep the aircraft's current AGL reading meaningful: if it's still
-        // sitting on the ground reference from spawn, shift groundRef by
-        // the same delta rather than leaving it pointing at the old value.
-        if (flight.groundRef != null) flight.groundRef += delta;
-        console.log(`[Elevation] ${icao}: corrected disc elevation ${(realElevM - delta).toFixed(1)}m → ${realElevM.toFixed(1)}m (real terrain sample)`);
-    };
-
-    if (Object.prototype.hasOwnProperty.call(_airportElevSampleCache, icao)) {
-        apply(_airportElevSampleCache[icao]);
+    if (!_isRetry && Object.prototype.hasOwnProperty.call(_airportElevSampleCache, icao)) {
+        const cached = _airportElevSampleCache[icao];
+        if (cached != null) _applyRealElevation(icao, lat, lng, gen, cached);
         return;
     }
-    _sampleRealGroundElevation(lat, lng).then(realElevM => {
+
+    const realElevM = _sampleRealGroundElevation(lat, lng);
+    if (realElevM != null) {
         _airportElevSampleCache[icao] = realElevM;
-        apply(realElevM);
-    });
+        _applyRealElevation(icao, lat, lng, gen, realElevM);
+    } else if (!_isRetry) {
+        // Tile likely hasn't streamed in yet — one single delayed retry,
+        // not a loop.
+        setTimeout(() => _correctAirportElevation(icao, lat, lng, true), 1500);
+    } else {
+        _airportElevSampleCache[icao] = null; // give up for this session, stop retrying
+    }
+}
+
+function _applyRealElevation(icao, lat, lng, gen, realElevM) {
+    if (gen !== _spawnGen) return; // stale — player already respawned elsewhere
+    if (!_activeAirportCenter || _activeAirportCenter.lat !== lat || _activeAirportCenter.lng !== lng) return;
+    const delta = realElevM - _activeAirportCenter.elevM;
+    if (Math.abs(delta) < 0.5) return; // already close enough, skip the log noise
+    _activeAirportCenter.elevM = realElevM;
+    // Keep the aircraft's current AGL reading meaningful: if it's still
+    // sitting on the ground reference from spawn, shift groundRef by the
+    // same delta rather than leaving it pointing at the old value.
+    if (flight.groundRef != null) flight.groundRef += delta;
+    console.log(`[Elevation] ${icao}: corrected disc elevation by ${delta.toFixed(1)}m (real terrain read) → ${realElevM.toFixed(1)}m`);
 }
 
 // Current AGL ground reference (meters) — see the AGL tracking block in
