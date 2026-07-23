@@ -223,7 +223,6 @@ const settings = {
     mapStyle: 'photoreal',
     flightSensitivity: 0.20,  // Control sens — new default 0.20x (was 1.0)
     flightAcceleration: 3.00, // Acceleration — new default 3.00x (was 1.0)
-    groundCollisionPrecision: 1.0, // 0.2–1.0 — Settings → Physics — ground/surface collision sample density (lower = better perf on slower devices)
     invertPitch: false,        // Pitch invert toggle — joystick up = up (false) or down (true)
     occlusionCulling: true,   // Settings → Display — mirrors scene.globe.depthTestAgainstTerrain, and also drives GP3DT no-memory grid culling (see applyGP3DTGridCulling)
     nightTerrainBrightness: 18, // 0–100 — Settings → Display — how bright terrain/imagery/buildings look while Night mode is on
@@ -1987,7 +1986,7 @@ function setRenderMode(mode) {
         mode = 'CSS';
     }
 
-    // Ground collision (applyGP3DTCollision) already checks
+    // Ground collision (applyAirportCircleCollision) already checks
     // settings.renderMode === '3D' itself each frame — no persistent
     // world/state to tear down when leaving 3D mode.
 
@@ -3150,235 +3149,61 @@ function ensureFlightSim(reseed) {
 // GROUND COLLISION
 // ==========================================
 // Ground/surface collision for Car, Bus, and Plane — always active while
-// in 3D Cesium mode (no toggle; see Settings → Physics for the Precision
-// slider).
+// in 3D Cesium mode.
 //
-// This does NOT use scene.sampleHeight(). sampleHeight() is a single
-// synchronous ray cast per call — calling it many times per frame (once
-// per ring point, per binary-search pass) means many separate scene
-// traversals every frame, which is the expensive part.
-//
-// Instead, real height readings are fetched with scene.clampToHeightMostDetailed(),
-// which takes a whole batch of points and resolves them in ONE scene
-// traversal — Cesium's own recommended API for "I need many real heights,
-// as cheaply as possible", as opposed to sampleHeight's "I need one height,
-// right now, blocking". Results are cached per small grid cell so that on
-// a typical frame nothing touches the scene at all — collision/AGL checks
-// just read a plain object lookup — and a new batched request only goes
-// out when the vehicle moves into cells that haven't been sampled yet (or
-// a cached cell has gone stale). The Precision slider controls the grid
-// cell size and how much of the surrounding ring is checked, trading
-// resolution for how often (and how large) those batches need to be.
-//
-// Deliberately NOT done: no static/precomputed collision mesh, no
-// approximate bounding boxes placed "because a building is probably
-// there", no third-party physics library. Every cached height came from a
-// real batched query and expires on its own (TTL below) — nothing is
-// fabricated, and nothing sticks around long enough to become a stale
-// invisible spike or wall if the tileset streams in more/less detail.
+// Same philosophy as the runway lights (see _spawnNightLights /
+// _addPapiLights): no manual per-point raycasting against the streamed
+// tileset, no cache to keep warm, nothing that can go stale as GP3DT tiles
+// load in at different levels of detail. The lights simply trust
+// HeightReference.CLAMP_TO_GROUND to always sit on whatever surface is
+// actually there; the ground collider is kept just as simple — a flat
+// disc, radius _AIRPORT_COLLISION_RADIUS_M, centered on the spawn
+// airport's published field elevation. Inside that disc "the ground" is
+// that one flat height; outside it there's no ground collision at all
+// (cruise flight, cross-country driving, etc. never needed it).
 
-// ── Height cache (batched, async — replaces per-point sampleHeight) ────
-const _HEIGHT_CELL_M = 2.0;       // grid cell size, meters
-const _HEIGHT_CACHE_TTL = 10.0;   // seconds before a cached cell is refreshed
-const _heightCache = new Map();   // "cellLat,cellLng" -> { height, t }
-const _heightPending = new Set(); // cell keys with an in-flight batch request already queued
+const _AIRPORT_COLLISION_RADIUS_M = 5000; // 5 km flat collision disc around the airport centre
 
-function _heightCellKey(lat, lng, mPerDegLat, mPerDegLng) {
-    const cellDegLat = _HEIGHT_CELL_M / mPerDegLat;
-    const cellDegLng = _HEIGHT_CELL_M / mPerDegLng;
-    return Math.round(lat / cellDegLat) + ',' + Math.round(lng / cellDegLng);
-}
+// Set once per spawn (see confirmSpawnLocation): the airport centre this
+// frame's collision disc is anchored to. null if the current spawn has no
+// known airport (e.g. a free map click) — collision is simply off then.
+let _activeAirportCenter = null; // { lat, lng, elevM }
 
-/** _getCachedHeight — instant, no scene access. Returns null on a cold cache miss. */
-function _getCachedHeight(lat, lng, mPerDegLat, mPerDegLng) {
-    const entry = _heightCache.get(_heightCellKey(lat, lng, mPerDegLat, mPerDegLng));
-    return entry ? entry.height : null;
-}
+// Current AGL ground reference (meters) — see the AGL tracking block in
+// updateCesiumCamera; kept as a plain variable, not a smoothed cache read,
+// since the flat disc has no LOD-streaming noise to smooth away.
+let _groundPlaneSmoothedHeight = 0;
 
 /**
- * _queueHeightRequests — batches every point whose cell is missing or
- * stale into a single clampToHeightMostDetailed() call. Never blocks the
- * calling frame; results land in the cache for a later frame to read.
- */
-function _queueHeightRequests(points, mPerDegLat, mPerDegLng) {
-    if (!cesiumViewer || typeof cesiumViewer.scene.clampToHeightMostDetailed !== 'function') return;
-    const now = performance.now() / 1000;
-    const needPts = [], needKeys = [];
-    for (const pt of points) {
-        const key = _heightCellKey(pt.lat, pt.lng, mPerDegLat, mPerDegLng);
-        if (_heightPending.has(key)) continue;
-        const entry = _heightCache.get(key);
-        if (entry && (now - entry.t) <= _HEIGHT_CACHE_TTL) continue;
-        needPts.push(pt); needKeys.push(key);
-    }
-    if (!needPts.length) return;
-    for (const k of needKeys) _heightPending.add(k);
-
-    const cartesians = needPts.map(pt => Cesium.Cartesian3.fromDegrees(pt.lng, pt.lat, 0));
-    cesiumViewer.scene.clampToHeightMostDetailed(cartesians).then(results => {
-        const t = performance.now() / 1000;
-        for (let i = 0; i < results.length; i++) {
-            _heightPending.delete(needKeys[i]);
-            const c = results[i];
-            if (!c) continue;
-            const carto = Cesium.Cartographic.fromCartesian(c);
-            if (!carto) continue;
-            _heightCache.set(needKeys[i], { height: carto.height, t });
-        }
-    }).catch(() => {
-        for (const k of needKeys) _heightPending.delete(k);
-    });
-}
-
-// ── Invisible ground-tracking plane (AGL) ──────────────────────────────
-let _groundPlaneSmoothedHeight = null;
-
-/** updateGroundCollisionPrecision — Settings → Physics slider. */
-function updateGroundCollisionPrecision(val) {
-    settings.groundCollisionPrecision = parseFloat(val);
-    const label = document.getElementById('val-ground-collision-precision');
-    if (label) label.textContent = settings.groundCollisionPrecision >= 1.0 ? 'Full' : Math.round(settings.groundCollisionPrecision * 100) + '%';
-    saveSettingsV2();
-}
-
-// Ring of sample points (meters, relative to vehicle-forward heading) used to
-// probe the real ground/surface height around the vehicle's footprint.
-// Precision below 1.0 thins this ring out (cheaper batches, at the cost of
-// missing the odd small bump) rather than disabling collision altogether.
-const _GP3DT_SAMPLE_RING_FULL = [
-    { fwd: 3.0, side: 0    }, { fwd: -3.0, side: 0    },
-    { fwd: 2.2, side: 1.6  }, { fwd: 2.2, side: -1.6  },
-    { fwd: -2.2, side: 1.6 }, { fwd: -2.2, side: -1.6 },
-    { fwd: 0,   side: 1.8  }, { fwd: 0,   side: -1.8  },
-];
-function _activeSampleRing() {
-    const p = Math.max(0.2, Math.min(1.0, settings.groundCollisionPrecision));
-    if (p >= 1.0) return _GP3DT_SAMPLE_RING_FULL;
-    const keep = Math.max(2, Math.round(_GP3DT_SAMPLE_RING_FULL.length * p));
-    const step = _GP3DT_SAMPLE_RING_FULL.length / keep;
-    const thinned = [];
-    for (let i = 0; i < keep; i++) thinned.push(_GP3DT_SAMPLE_RING_FULL[Math.floor(i * step)]);
-    return thinned;
-}
-
-// How obstacle-clearance checks scale with the vehicle: a curb/step small
-// enough to be under this height (meters, above the vehicle's own ground
-// level) is treated as ground texture, not a wall — avoids the "gentle
-// slope feels like a wall" problem.
-function vehicleObstacleClearanceM(vehicle) {
-    if (vehicle === 'car') return 0.30;
-    if (vehicle === 'bus') return 0.35;
-    return 0.35; // plane — same as bus, only matters while on/near the ground
-}
-
-// ── GP3DT check throttling ─────────────────────────────────────────────
-// The ring-sample + clampToHeightMostDetailed work below is real raycasting
-// against the streamed photorealistic tiles — not free. Most of the 0-500ft
-// band has essentially zero real collision risk (that only becomes likely
-// close to the ground during taxi/takeoff/landing), so we check far less
-// often the higher within that band a plane is, and only go back to a
-// full every-frame check once it's genuinely close to the surface. This is
-// what keeps FPS high while still descending/climbing through that band.
-let _gp3dtAccum = 0;
-function _gp3dtCheckIntervalSec(vehicle, aglFt) {
-    if (!isPlaneType(vehicle)) return 0;      // cars/buses: always check, they're always near the ground
-    if (aglFt > 350) return 0.20;             // ~5x/sec — plenty this high
-    if (aglFt > 150) return 0.08;             // ~12x/sec — approach/climb-out
-    return 0;                                  // near the ground: every frame, full precision
-}
-
-/**
- * applyGP3DTCollision — called once per frame from the main loop, after the
- * vehicle's normal (non-collidable) position update has produced a proposed
- * new state.lat/state.lng. Checks the cached heights around the proposed
- * footprint (an instant Map lookup, no scene access) and blocks the move
- * for this frame if a real surface is in the way; any cells that are
- * missing/stale get queued as one batched request for future frames.
+ * applyAirportCircleCollision — called once per frame from the main loop,
+ * after the vehicle's normal (non-collidable) position update has produced
+ * a proposed new state.lat/state.lng. If the vehicle is within the flat
+ * collision disc around the active airport, it simply can't descend below
+ * the disc's flat ground height; outside the disc there's nothing to check.
  *
- * prevLat/prevLng: vehicle position BEFORE this frame's normal integration.
+ * prevLat/prevLng: vehicle position BEFORE this frame's normal integration
+ * (kept as parameters for parity with the main loop's snapshot, unused by
+ * the flat-disc check itself).
  */
-function applyGP3DTCollision(dt, prevLat, prevLng, prevHeadingRad) {
-    if (!cesiumViewer || !photorealTileset || settings.renderMode !== '3D') return;
-    // Planes only collide near the ground (taxi/takeoff/landing) — at
-    // cruise altitude there's nothing meaningful under a 3-8m sample ring
-    // and it would just queue pointless height requests every frame.
-    if (isPlaneType(state.vehicle) && (flight.alt || 0) > 500) { _gp3dtAccum = 0; return; }
-
-    // Throttle: skip the expensive ring-sample/clamp work on most frames
-    // when we're higher within the 500ft band (see _gp3dtCheckIntervalSec).
-    // The plane keeps moving normally in between checks — we're just not
-    // spending a raycast batch on every single one of those frames.
-    _gp3dtAccum += dt;
-    const _gp3dtInterval = _gp3dtCheckIntervalSec(state.vehicle, flight.alt || 0);
-    if (_gp3dtAccum < _gp3dtInterval) return;
-    _gp3dtAccum = 0;
+function applyAirportCircleCollision(dt, prevLat, prevLng) {
+    if (!cesiumViewer || settings.renderMode !== '3D') return;
+    if (!_activeAirportCenter) return; // no known airport for this spawn — nothing to collide with
 
     const mPerDegLat = 111320;
-    const mPerDegLng = 111320 * Math.cos(prevLat * Math.PI / 180);
+    const mPerDegLng = 111320 * Math.cos(_activeAirportCenter.lat * Math.PI / 180);
+    const dEast  = (state.lng - _activeAirportCenter.lng) * mPerDegLng;
+    const dNorth = (state.lat - _activeAirportCenter.lat) * mPerDegLat;
+    const distM  = Math.hypot(dEast, dNorth);
+    if (distM > _AIRPORT_COLLISION_RADIUS_M) return; // outside the disc — no ground here
 
-    const originHeight = _getCachedHeight(prevLat, prevLng, mPerDegLat, mPerDegLng);
-
-    const desiredEast  = (state.lng - prevLng) * mPerDegLng;
-    const desiredNorth = (state.lat - prevLat) * mPerDegLat;
-    const moving = Math.hypot(desiredEast, desiredNorth) >= 1e-6;
-    const moveHdg = moving ? Math.atan2(desiredEast, desiredNorth) : prevHeadingRad;
-
-    // Ring points, at the vehicle's PROPOSED new position, oriented along
-    // its direction of travel — these are what we need cached to decide
-    // whether this frame's move is clear. Above 150ft AGL we also thin the
-    // ring further on top of the manual precision slider, same reasoning
-    // as the check-interval throttle above: less real risk that high, so
-    // fewer raycasts needed to catch it.
-    let _ring = _activeSampleRing();
-    if (isPlaneType(state.vehicle) && (flight.alt || 0) > 150 && _ring.length > 4) {
-        _ring = [_ring[0], _ring[1], _ring[2], _ring[3]];
+    // Flat ground: the vehicle simply can't descend through the airport's
+    // field elevation while inside the disc. flight.groundRef already
+    // tracks this same elevation from spawn (see confirmSpawnLocation), so
+    // AGL naturally bottoms out at 0 — cars/buses sit on the disc by
+    // construction and need no separate clamp.
+    if (isPlaneType(state.vehicle) && (flight.alt || 0) < 0) {
+        flight.alt = 0;
     }
-    const ringPts = _ring.map(p => {
-        const east  = p.fwd * Math.sin(moveHdg) + p.side * Math.cos(moveHdg);
-        const north = p.fwd * Math.cos(moveHdg) - p.side * Math.sin(moveHdg);
-        return { lat: state.lat + north / mPerDegLat, lng: state.lng + east / mPerDegLng };
-    });
-
-    // Queue a single batched request for anything missing/stale (origin +
-    // ring together) — this is the only place the scene actually gets
-    // touched, and only for the cells we don't already have a fresh
-    // reading for.
-    _queueHeightRequests([{ lat: prevLat, lng: prevLng }, ...ringPts], mPerDegLat, mPerDegLng);
-
-    if (originHeight === null) return; // nothing cached under us yet — request is queued, try again once it lands
-
-    // Airborne + moving forward: noclip through anything that isn't the
-    // ground itself (buildings, towers, foliage, etc.) — only an actual
-    // on-ground/taxiing plane should ever be stopped dead by an obstacle.
-    // "On the ground" here mirrors the onGround gate used for A320 callouts
-    // (agl <= 2 ft — see updateA320Audio) rather than flight.gearDown, since
-    // gear can be down while still flying.
-    const airborneNoclip = isPlaneType(state.vehicle) && (flight.alt || 0) > 2 && state.speed > 0;
-
-    const tolerance = vehicleObstacleClearanceM(state.vehicle);
-    let hitCount = 0;
-    if (!airborneNoclip) {
-        for (const pt of ringPts) {
-            const h = _getCachedHeight(pt.lat, pt.lng, mPerDegLat, mPerDegLng);
-            if (h === null) continue; // not cached yet — request already queued above; don't guess, don't block on it
-            if (h - originHeight > tolerance) hitCount++;
-        }
-    }
-    // Require at least 2 independent sample points to agree before treating
-    // it as a real obstacle. A single point spiking is almost always a
-    // photorealistic tile still streaming in at a coarser LOD settling into
-    // place, not an actual wall — and blocking on just one of those is what
-    // caused the plane to appear to stop dead in open air. A genuine wall or
-    // rising terrain shows up consistently across neighboring sample points.
-    const blocked = hitCount >= 2;
-
-    if (blocked) {
-        // A real surface is in the way this frame — hold at the previous
-        // position rather than passing through it.
-        state.lat = prevLat;
-        state.lng = prevLng;
-    }
-    // Otherwise state.lat/lng already carries the normal integrator's move.
 }
 
 const flight = {
@@ -5780,51 +5605,24 @@ function updateCesiumCamera(dt) {
 
     const isPlane = isPlaneType(state.vehicle);
 
-    // ── AGL (Above Ground Level) via an invisible ground-tracking plane ──
-    // We keep a second, invisible "plane" that always sits on the real
-    // terrain directly beneath the visible vehicle's current lat/lng — a
-    // shadow that never leaves the ground. Its height is what flight.alt
-    // (AGL, in feet) is measured from: while airborne we continuously
-    // recompute the vertical distance between the real plane and this
-    // ground plane; when they're at the same horizontal position and the
-    // real plane settles onto it, that's ground contact (taxi/landing).
-    //
-    // The reading comes from the same cached/batched height system as
-    // ground collision (_getCachedHeight / _queueHeightRequests) — an
-    // instant Map lookup, not a live scene raycast. If the current cell
-    // hasn't been queried yet (or has gone stale) a batched request is
-    // queued and we keep the last known reading until it lands, smoothly
-    // interpolating toward the new one so a cache update never shows up
-    // as an "invisible bump".
-    {
+    // ── AGL (Above Ground Level) via the flat airport disc ───────────────
+    // Same simple model as ground collision (applyAirportCircleCollision):
+    // no live scene raycast, no cache. flight.alt (AGL, in feet) is
+    // measured from the active airport's flat field elevation whenever the
+    // vehicle is within the 5 km disc — falling back to 0 m (sea level)
+    // outside it or when no airport is known for this spawn, matching the
+    // runway lights' "keep it simple" approach.
+    let groundHeight = 0;
+    if (_activeAirportCenter) {
         const _mPerDegLat = 111320;
-        const _mPerDegLng = 111320 * Math.cos(state.lat * Math.PI / 180);
-        _queueHeightRequests([{ lat: state.lat, lng: state.lng }], _mPerDegLat, _mPerDegLng);
-        const cached = _getCachedHeight(state.lat, state.lng, _mPerDegLat, _mPerDegLng);
-        if (cached !== null) {
-            if (_groundPlaneSmoothedHeight === null) {
-                _groundPlaneSmoothedHeight = cached;
-            } else {
-                // Gentler smoothing (was rate 10 -> ~63% closed in 0.1s;
-                // now rate 2.5 -> ~63% closed in 0.4s) so a cache refresh
-                // that returns a different height (common with streamed
-                // GP3DT tiles settling into a different LOD) doesn't show
-                // up as a sudden "elevator" step.
-                const target = cached;
-                const smoothed = _groundPlaneSmoothedHeight + (target - _groundPlaneSmoothedHeight) * (1 - Math.exp(-2.5 * dt));
-                // Extra safety clamp: never let the ground reference move
-                // more than 1.5 m per second, regardless of how big the
-                // jump in the raw reading was. Real terrain never moves;
-                // large deltas are LOD/streaming noise, not genuine relief,
-                // so this caps the visible correction speed without ever
-                // freezing it.
-                const maxStep = 1.5 * dt;
-                const delta = smoothed - _groundPlaneSmoothedHeight;
-                _groundPlaneSmoothedHeight += Math.max(-maxStep, Math.min(maxStep, delta));
-            }
+        const _mPerDegLng = 111320 * Math.cos(_activeAirportCenter.lat * Math.PI / 180);
+        const _dEast  = (state.lng - _activeAirportCenter.lng) * _mPerDegLng;
+        const _dNorth = (state.lat - _activeAirportCenter.lat) * _mPerDegLat;
+        if (Math.hypot(_dEast, _dNorth) <= _AIRPORT_COLLISION_RADIUS_M) {
+            groundHeight = _activeAirportCenter.elevM;
         }
     }
-    const groundHeight = _groundPlaneSmoothedHeight || 0;
+    _groundPlaneSmoothedHeight = groundHeight;
     // groundRef IS the invisible ground plane's current height — updated
     // continuously (never frozen) so flight.alt always reflects real AGL.
     flight.groundRef = groundHeight;
@@ -6416,9 +6214,8 @@ function update() {
 
     // ── Physics ───────────────────────────────────────────────────────────
     // Snapshot BEFORE this frame's normal (non-collidable) integration, so
-    // applyGP3DTCollision() below has a known-good origin to resolve against.
-    const _gp3dtPrevLat = state.lat, _gp3dtPrevLng = state.lng;
-    const _gp3dtPrevHdgRad = state.heading * Math.PI / 180;
+    // applyAirportCircleCollision() below has a known-good origin.
+    const _collisionPrevLat = state.lat, _collisionPrevLng = state.lng;
 
     if (isPlaneType(state.vehicle)) {
         updateFlight(dt);
@@ -6469,9 +6266,9 @@ function update() {
         state.heading = (state.heading + 360) % 360;
     }
 
-    // ── Ground Collision — always on while in 3D Cesium mode; the function
-    // itself lazily initializes on first use and no-ops until it's ready. ──
-    applyGP3DTCollision(dt, _gp3dtPrevLat, _gp3dtPrevLng, _gp3dtPrevHdgRad);
+    // ── Ground Collision — flat 5 km disc around the active airport; a
+    // no-op outside 3D mode or when no airport is known for this spawn. ──
+    applyAirportCircleCollision(dt, _collisionPrevLat, _collisionPrevLng);
 
     // ── Smooth camera heading ─────────────────────────────────────────────
     let diff = (state.heading - camHeading + 180) % 360 - 180;
@@ -7724,6 +7521,13 @@ function confirmSpawnLocation() {
     // re-populated below if we can resolve one (chosen runway, or a fallback
     // lookup by ICAO), left null otherwise so no fake lights get drawn.
     _activeRunway = null;
+
+    // Reset the flat 5 km ground-collision disc for this spawn — re-anchored
+    // below to the airport's own centre/elevation when one is known, left
+    // null otherwise (free map click) so ground collision is simply off.
+    _activeAirportCenter = (ap.icao && ap.icao !== '—')
+        ? { lat: ap.lat, lng: ap.lng, elevM: (ap.elev != null ? ap.elev * 0.3048 : 0) }
+        : null;
 
     if (isPlaneType(state.vehicle) && rwyVal) {
         try {

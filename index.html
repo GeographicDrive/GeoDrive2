@@ -286,14 +286,9 @@
                 <div class="settings-section">
                     <h3>🛡️ Ground Collision</h3>
                     <p class="desc-text" style="margin-top:0;">
-                        Car, Bus, and Plane all collide with the real ground/surface as they drive — colliders are
-                        built live from real terrain/building samples each frame, so nothing is placed in advance.
-                    </p>
-                    <label style="margin-top:12px;">Precision: <span id="val-ground-collision-precision">Full</span></label>
-                    <input type="range" class="slider" id="set-ground-collision-precision" min="0.2" max="1.0" step="0.1" value="1.0" oninput="updateGroundCollisionPrecision(this.value)">
-                    <p class="desc-text" id="ground-collision-status-text">
-                        Lower precision samples the surface less often, trading a small amount of accuracy (occasional
-                        soft bumps) for smoother performance on slower devices.
+                        Car, Bus, and Plane collide with a simple flat ground plane covering a 5 km radius around
+                        the centre of the active airport — the same "keep it simple" approach used for the runway
+                        lights, with no live terrain sampling and nothing to configure.
                     </p>
                 </div>
                 </div>
