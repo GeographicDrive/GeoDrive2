@@ -3264,7 +3264,18 @@ async function _sampleRealGroundElevation(lat, lng) {
     try {
         if (typeof cesiumViewer.scene.sampleHeightMostDetailed === 'function') {
             const cart = Cesium.Cartesian3.fromDegrees(lng, lat, 0);
-            const results = await cesiumViewer.scene.sampleHeightMostDetailed([cart]);
+            // Exclude the photorealistic 3D Tiles (buildings/hangars/towers)
+            // from the ray test — sampleHeightMostDetailed hits ANY primitive
+            // in the scene by default, and if the airport's reference point
+            // sits near a terminal/hangar the ray hits the ROOF instead of
+            // the tarmac, handing back a rooftop height as "ground elevation".
+            // That's what was causing spawns to sit far above the runway at
+            // airports with buildings near the DB lat/lng: the flat collision
+            // disc (and the plane) got anchored to roof height, not asphalt.
+            // Restricting to the globe/terrain guarantees we always measure
+            // the actual ground, never a structure sitting on top of it.
+            const excludeObjs = photorealTileset ? [photorealTileset] : undefined;
+            const results = await cesiumViewer.scene.sampleHeightMostDetailed([cart], excludeObjs);
             const hit = results && results[0];
             // Reject the degenerate (0,0,0) ray-miss result explicitly, in
             // addition to the range check below — belt and suspenders,
