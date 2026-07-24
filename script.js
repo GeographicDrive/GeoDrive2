@@ -1636,7 +1636,7 @@ function syncAllSettingsUI() {
     setVal('set-rudder-sensitivity', settings.rudderSensitivity); setTxt('val-rudder-sensitivity', settings.rudderSensitivity.toFixed(2));
     setVal('set-veh-size', settings.vehicleScale); setTxt('val-veh-size', settings.vehicleScale.toFixed(1));
     setVal('set-veh-size-3d', settings.vehicleScale); setTxt('val-veh-size-3d', settings.vehicleScale.toFixed(1));
-    setVal('set-plane-height-offset', settings.planeHeightOffset); setTxt('val-plane-height-offset', settings.planeHeightOffset.toFixed(1));
+    setVal('set-plane-height-offset', settings.planeHeightOffset); setVal('set-plane-height-offset-input', settings.planeHeightOffset); setTxt('val-plane-height-offset', settings.planeHeightOffset.toFixed(1));
     setVal('set-2d-scene-mode', settings.sceneMode2D);
     setVal('set-pan-speed', settings.panSpeed); setTxt('val-pan-speed', settings.panSpeed.toFixed(2));
     setChk('set-rotate-map', state.headUp);
@@ -2101,9 +2101,17 @@ function updateVehicleScale(val)   {
     saveSettingsV2();
 }
 function updatePlaneHeightOffset(val) {
-    settings.planeHeightOffset = parseFloat(val);
-    const el = document.getElementById('val-plane-height-offset');
-    if (el) el.textContent = parseFloat(val).toFixed(1);
+    let num = parseFloat(val);
+    if (isNaN(num)) return;
+    num = Math.max(-1000, Math.min(1000, num));
+    settings.planeHeightOffset = num;
+    const label = document.getElementById('val-plane-height-offset');
+    if (label) label.textContent = num.toFixed(1);
+    // Keep the slider and the precise-entry textbox in sync with each other.
+    const slider = document.getElementById('set-plane-height-offset');
+    if (slider && parseFloat(slider.value) !== num) slider.value = num;
+    const input = document.getElementById('set-plane-height-offset-input');
+    if (input && parseFloat(input.value) !== num) input.value = num;
     saveSettingsV2();
 }
 function updateMapZoom(val)        { settings.mapZoom = parseFloat(val); document.getElementById('val-map-zoom').innerText = val; map.setZoom(settings.mapZoom); }
@@ -6734,8 +6742,26 @@ document.getElementById('set-cam-rotate-plane').checked = settings.cameraRotates
     }
 })();
 
+// ── Auto cache-clear / asset-reload on every entry ──────────────────────────
+// Same effect as the manual "Clear Cache" + "Reload Assets" buttons in
+// Troubleshooting, but run automatically on every page load / game start so
+// stale tiles/assets never linger. This does NOT touch localStorage settings
+// (key bindings, sliders, tokens, etc.) — only tile/cache-prefixed keys and
+// in-memory asset state, exactly like the manual buttons do.
+function autoClearCacheAndReloadAssets() {
+    try {
+        Object.keys(localStorage)
+            .filter(k => k.startsWith('biv_tile_') || k.startsWith('biv_cache_'))
+            .forEach(k => localStorage.removeItem(k));
+    } catch (e) {}
+    if (settings.mapStyle === 'photoreal') tryLoadPhotorealisticTiles();
+    else tryEnableWorldTerrain();
+    if (settings.osmBuildings) tryLoadOsmBuildings();
+}
+
 // ── Settings tree v2: load persisted settings, apply theme/language, sync UI ──
 loadSettingsV2();
+autoClearCacheAndReloadAssets();
 applyTheme(settings.theme);
 document.getElementById('set-language') && (document.getElementById('set-language').value = settings.language);
 requestAnimationFrame(update);
