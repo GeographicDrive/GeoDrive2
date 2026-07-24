@@ -3213,25 +3213,61 @@ let _spawnGen = 0;
  * That cost is paid at most ONCE per airport (see the cache in
  * _resolveAirportElevation below).
  */
+// Plausible real-world ground elevation range (meters). Used to reject
+// degenerate samples — see _isPlausibleGroundElevM below for why this is
+// necessary and not just belt-and-suspenders.
+const _GROUND_ELEV_MIN_M = -500;   // below Dead Sea (-430 m), small margin
+const _GROUND_ELEV_MAX_M = 6500;   // above the highest airport on Earth (~4700 m) with margin
+
+/**
+ * _isPlausibleGroundElevM — guards against the specific failure mode that
+ * caused "spawn at the center of the Earth" (camera/plane collapsing to
+ * the globe's core, rendering as if turned inside-out from within): when
+ * scene#sampleHeightMostDetailed's ray doesn't hit anything (tileset/terrain
+ * not yet resident at that exact point), it resolves with a degenerate
+ * Cartesian3(0,0,0) — NOT undefined/null. That value is still truthy, so a
+ * plain `results[0] &&` guard doesn't catch it, and
+ * Cesium.Cartographic.fromCartesian(0,0,0) is a degenerate case that comes
+ * back as a *finite* number around -6,378,137 m (negative WGS84 semi-major
+ * axis) rather than NaN — so Number.isFinite() alone accepts it as if it
+ * were a real elevation. Every frame after that, updateCesiumCamera builds
+ * anchorHeight = groundHeight + flight.alt*0.3048, and with groundHeight at
+ * -6,378,137 m the vehicle/camera position collapses to essentially the
+ * center of the Earth — which is the "inside the sphere, whole globe
+ * visible, everything looks inverted" symptom.
+ *
+ * No real airport is anywhere near this range, so any sample landing
+ * outside plausible Earth-surface elevations is treated as "no data" and
+ * discarded rather than trusted.
+ */
+function _isPlausibleGroundElevM(h) {
+    return Number.isFinite(h) && h > _GROUND_ELEV_MIN_M && h < _GROUND_ELEV_MAX_M;
+}
+
 async function _sampleRealGroundElevation(lat, lng) {
     if (!cesiumViewer || !cesiumViewer.scene.globe) return null;
     const carto = Cesium.Cartographic.fromDegrees(lng, lat);
 
     try {
         const fast = cesiumViewer.scene.globe.getHeight(carto);
-        if (Number.isFinite(fast)) return fast;
+        if (_isPlausibleGroundElevM(fast)) return fast;
     } catch (e) { /* fall through to the guaranteed path below */ }
 
     try {
         if (typeof cesiumViewer.scene.sampleHeightMostDetailed === 'function') {
             const cart = Cesium.Cartesian3.fromDegrees(lng, lat, 0);
             const results = await cesiumViewer.scene.sampleHeightMostDetailed([cart]);
-            const h = results && results[0] && Cesium.Cartographic.fromCartesian(results[0]).height;
-            return Number.isFinite(h) ? h : null;
+            const hit = results && results[0];
+            // Reject the degenerate (0,0,0) ray-miss result explicitly, in
+            // addition to the range check below — belt and suspenders,
+            // since a magnitude-0 vector is never a legitimate hit point.
+            if (!hit || (hit.x === 0 && hit.y === 0 && hit.z === 0)) return null;
+            const h = Cesium.Cartographic.fromCartesian(hit).height;
+            return _isPlausibleGroundElevM(h) ? h : null;
         }
         if (cesiumViewer.terrainProvider && typeof Cesium.sampleTerrainMostDetailed === 'function') {
             const [sampled] = await Cesium.sampleTerrainMostDetailed(cesiumViewer.terrainProvider, [carto]);
-            return Number.isFinite(sampled.height) ? sampled.height : null;
+            return _isPlausibleGroundElevM(sampled.height) ? sampled.height : null;
         }
     } catch (e) {
         console.warn('[Elevation] Real ground sample failed, keeping database elevation:', e);
