@@ -211,18 +211,23 @@ const settings = {
     vehicleScale: 1.0, mapZoom: 18,
     planeHeightOffset: 0, // meters — manual visual nudge for aircraft model/camera height (fixes hitbox/offset mismatches)
     steeringMode: 'arrows', cameraZoom: 1.0,
-    steeringSensitivity: 0.4,  // Car/bus steering sens — new default 0.4 (was 1.0)
+    steeringSensitivity: 1.0,  // Car/bus steering sens — default 1.0
     fov: 120,            // degrees — applied to Cesium camera frustum in 3D mode
-    thirdPersonZoom: 0.50, // new default 0.50 (was 0.90)
+    thirdPersonZoom: 1.0, // default 1.0x
     cameraFollowDelay: 2.0,
     freeLookReturnDelay: 3.0, // seconds of no drag input before 3D free-look camera springs back to center; Infinity = never auto-resets
     osmBuildings: false,
     fullscreen: false,
     cameraLookBlend: 0.5,
-    cameraRotatesWithPlane: true,  // Camera rolls On — new default (was false)
+    cameraRotatesWithPlane: false,  // Camera rolls off — default
     mapStyle: 'photoreal',
-    flightSensitivity: 0.20,  // Control sens — new default 0.20x (was 1.0)
-    flightAcceleration: 3.00, // Acceleration — new default 3.00x (was 1.0)
+    flightSensitivity: 1.0,  // Control sens — default 1.0x. Calibrated so that
+                              // full aileron deflection at 1.0x produces ~15°/s
+                              // roll rate (measured at ~150 kt / 77 m/s, see
+                              // the delta_a coefficient in updateFlight()).
+    flightAcceleration: 1.0, // Acceleration — default 1.0x. Calibrated (with
+                              // T_max below) so TOGA throttle at 1.0x reaches
+                              // 180 kt in ~35 s from a standstill.
     invertPitch: false,        // Pitch invert toggle — joystick up = up (false) or down (true)
     occlusionCulling: true,   // Settings → Display — mirrors scene.globe.depthTestAgainstTerrain, and also drives GP3DT no-memory grid culling (see applyGP3DTGridCulling)
     nightTerrainBrightness: 18, // 0–100 — Settings → Display — how bright terrain/imagery/buildings look while Night mode is on
@@ -3122,7 +3127,9 @@ const FLIGHT_CONFIGS = {
         },
         prop: {
             type: 'jet',
-            T_max: 240000        // N — ~2x CFM56-5B sea-level static thrust
+            T_max: 182000        // N — calibrated so TOGA (100%) at
+                                 // flightAcceleration=1.0x reaches 180 kt in
+                                 // ~35 s from a standing start (was 240000)
         }
     }
 };
@@ -4049,7 +4056,10 @@ function updateFlight(dt) {
     // Elevator sign convention: nose-up command -> negative Cmde deflection.
     const controls = {
         delta_e: -pitchInput * 0.45 * settings.flightSensitivity,
-        delta_a:  rollInput  * 0.45 * settings.flightSensitivity,
+        // 0.19 rad of aileron at full stick + flightSensitivity=1.0x yields a
+        // steady-state roll rate of ~15°/s at ~150 kt (77 m/s) per the
+        // AdvancedFlightDynamics roll-axis model (Clda/Clp/Ixz coupling).
+        delta_a:  rollInput  * 0.19 * settings.flightSensitivity,
         delta_r:  delta_r_final * Math.PI / 180, // deg -> rad
         throttle: (flight.throttle / 100) * settings.flightAcceleration,
         gearDown: flight.gearDown,
