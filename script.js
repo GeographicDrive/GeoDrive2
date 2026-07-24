@@ -7729,6 +7729,47 @@ async function confirmSpawnLocation() {
         if (gen !== _spawnGen) return; // player cancelled/respawned elsewhere while we were waiting
     }
 
+    // ── 0. Pre-position HIGH above the spawn point, before sampling anything ──
+    // This is the actual fix for "spawns underground / sampleHeight returns
+    // garbage": sampleHeightMostDetailed / globe.getHeight can only return a
+    // real number for tiles that have actually streamed in, and GP3DT/terrain
+    // tile loading is driven by camera position — nothing streams in for a
+    // spot the camera has never looked at. The old order sampled height
+    // BEFORE moving the camera there at all, so it was always sampling empty
+    // space (returns 0/null → plane placed at/under the database elevation
+    // with nothing real under it yet → underground).
+    //
+    // Fix: jump the camera to the spawn lat/lng at a fixed, safely-high
+    // altitude FIRST (high enough to clear any real-world terrain under it,
+    // so this step can never itself spawn "inside" anything), which kicks
+    // off tile loading for the correct tile column. Only once that's done do
+    // we sample height (now against real streamed-in tiles) and drop
+    // everything — camera, aircraft, collision disc — down to the real
+    // ground a moment later.
+    const _SPAWN_PREPOSITION_ALT_M = 4000; // meters — clears virtually all real-world terrain
+    if (cesiumViewer) {
+        try {
+            setLoadingText('Loading terrain tile…');
+            const highPos = Cesium.Cartesian3.fromDegrees(lng, lat, _SPAWN_PREPOSITION_ALT_M);
+            cesiumViewer.camera.setView({
+                destination: highPos,
+                orientation: {
+                    heading: Cesium.Math.toRadians(state.heading || 0),
+                    pitch:   Cesium.Math.toRadians(-90), // look straight down at the spawn point
+                    roll:    0
+                }
+            });
+            // Give the tile loader a couple of render frames to actually
+            // issue requests for the column now under the camera before we
+            // force-sample it below — setView alone doesn't guarantee a
+            // frame has rendered yet.
+            await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+            if (gen !== _spawnGen) return; // player cancelled/respawned elsewhere while we were waiting
+        } catch (e) {
+            console.warn('[Spawn] High pre-position failed:', e);
+        }
+    }
+
     // ── Resolve the REAL ground elevation before placing anything at all ───
     // This is what stops the plane ever spawning below/inside the terrain:
     // lat/lng/elev above are now final (runway threshold or airport centre,
@@ -7740,7 +7781,10 @@ async function confirmSpawnLocation() {
     // instead of just overwriting it. Usually resolves in well under a
     // second (instant on repeat visits to an airport, thanks to the
     // cache); only pays a longer one-time cost the very first time a given
-    // airport's terrain has never been sampled in this session.
+    // airport's terrain has never been sampled in this session. Now runs
+    // with the camera already sitting above the spawn point (step 0 above),
+    // so the tiles being sampled here are ones actually being streamed in,
+    // not empty space.
     if (_activeAirportCenter) {
         setLoadingText('Sampling real ground elevation…');
         const realCentreElevM = await _resolveAirportElevation(ap.icao, ap.lat, ap.lng);
@@ -7798,10 +7842,11 @@ async function confirmSpawnLocation() {
         baseLng = lng;
     }
 
-    // ── 3. Sync Cesium camera to spawn location immediately ────────────────
-    // (This is what makes the terrain/tile loading we wait for below
-    // actually be loading the right tiles — camera has to be looking at
-    // the spawn point for the tile loader to prioritize it.)
+    // ── 3. Teleport the Cesium camera DOWN from the high pre-position to the
+    // real, now-known-good spawn altitude. This is the "drop to the ground"
+    // step: elev/elevM here are the real-sampled values from step above (not
+    // the raw database figure), so this is a teleport onto real terrain, not
+    // a guess that terrain streams in underneath afterward.
     if (cesiumViewer) {
         try {
             let camAlt, camPitch;
@@ -7824,7 +7869,7 @@ async function confirmSpawnLocation() {
                 }
             });
         } catch (e) {
-            console.warn('[Spawn] Cesium camera pre-position failed:', e);
+            console.warn('[Spawn] Cesium camera final placement failed:', e);
         }
     }
 
